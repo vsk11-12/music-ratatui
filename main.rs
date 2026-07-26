@@ -1,0 +1,1038 @@
+use std::env;
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+use anyhow::Context;
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MediaKeyCode},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    Frame, Terminal,
+};
+use serde_json::{json, Value};
+
+const AUDIO_EXTS: &[&str] = &[
+    "mp3", "flac", "ogg", "wav", "m4a", "aac", "opus", "wma", "aiff", "alac",
+];
+
+// ---------------------------------------------------------------------------
+// Views & Entry
+// ---------------------------------------------------------------------------
+
+#[derive(PartialEq, Clone, Copy)]
+enum ViewMode {
+    Files,
+    Queue,
+    Zen,
+}
+
+#[derive(Clone)]
+struct Entry {
+    path: PathBuf,
+    is_dir: bool,
+}
+
+impl Entry {
+    fn name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.path.to_string_lossy().to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Theme & Colors (Defaults to Midnight Teal)
+// ---------------------------------------------------------------------------
+
+fn parse_hex_color(hex: &str) -> Color {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() == 6 {
+        if let (Ok(r), Ok(g), Ok(b)) = (
+            u8::from_str_radix(&hex[0..2], 16),
+            u8::from_str_radix(&hex[2..4], 16),
+            u8::from_str_radix(&hex[4..6], 16),
+        ) {
+            return Color::Rgb(r, g, b);
+        }
+    }
+    Color::Reset
+}
+
+#[derive(Clone, Copy)]
+struct Theme {
+    border: Color,
+    title: Color,
+    dir: Color,
+    playing: Color,
+    text: Color,
+    highlight_bg: Color,
+    highlight_fg: Color,
+    volume: Color,
+}
+
+impl Theme {
+    fn load_or_default() -> Self {
+        let config_path = env::var("HOME")
+            .ok()
+            .map(|home| PathBuf::from(home).join(".config/tuiplay/theme.json"));
+
+        let local_path = PathBuf::from("theme.json");
+        let target_path = config_path.filter(|p| p.exists()).unwrap_or(local_path);
+
+        if let Ok(content) = fs::read_to_string(&target_path) {
+            if let Ok(v) = serde_json::from_str::<Value>(&content) {
+                let get_color = |key: &str, default: &str| -> Color {
+                    v.get(key)
+                        .and_then(|val| val.as_str())
+                        .map(parse_hex_color)
+                        .unwrap_or_else(|| parse_hex_color(default))
+                };
+
+                return Self {
+                    border: get_color("border", "#008080"),
+                    title: get_color("title", "#70eceb"),
+                    dir: get_color("dir", "#20b2aa"),
+                    playing: get_color("playing", "#00f5d4"),
+                    text: get_color("text", "#cfedf0"),
+                    highlight_bg: get_color("highlight_bg", "#132e38"),
+                    highlight_fg: get_color("highlight_fg", "#80f3e6"),
+                    volume: get_color("volume", "#5bc0be"),
+                };
+            }
+        }
+
+        // Midnight Teal Fallback Theme
+        Self {
+            border: parse_hex_color("#008080"),
+            title: parse_hex_color("#70eceb"),
+            dir: parse_hex_color("#20b2aa"),
+            playing: parse_hex_color("#00f5d4"),
+            text: parse_hex_color("#cfedf0"),
+            highlight_bg: parse_hex_color("#132e38"),
+            highlight_fg: parse_hex_color("#80f3e6"),
+            volume: parse_hex_color("#5bc0be"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mpv IPC Controller
+// ---------------------------------------------------------------------------
+
+struct Mpv {
+    child: Child,
+    writer: UnixStream,
+    reader: BufReader<UnixStream>,
+    socket_path: PathBuf,
+}
+
+impl Mpv {
+    fn spawn() -> anyhow::Result<Self> {
+        let socket_path =
+            env::temp_dir().join(format!("tuiplay-mpv-{}.sock", std::process::id()));
+        let _ = fs::remove_file(&socket_path);
+
+        let mut cmd = Command::new("mpv");
+        cmd.arg("--idle=yes")
+            .arg("--no-video")
+            .arg("--no-terminal")
+            .arg("--really-quiet")
+            .arg(format!("--input-ipc-server={}", socket_path.display()));
+
+        // Enable MPRIS plugin if installed on Arch Linux (/usr/lib/mpv/mpris.so)
+        let mpris_plugin = Path::new("/usr/lib/mpv/mpris.so");
+        if mpris_plugin.exists() {
+            cmd.arg(format!("--script={}", mpris_plugin.display()));
+        }
+
+        let child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to start mpv -- is it installed?")?;
+
+        let mut connected = None;
+        for _ in 0..50 {
+            if let Ok(s) = UnixStream::connect(&socket_path) {
+                let _ = s.set_read_timeout(Some(Duration::from_millis(150)));
+                connected = Some(s);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let writer = connected.context("mpv did not open its IPC socket in time")?;
+        let reader = BufReader::new(writer.try_clone()?);
+
+        Ok(Self {
+            child,
+            writer,
+            reader,
+            socket_path,
+        })
+    }
+
+    fn send(&mut self, payload: Value) -> anyhow::Result<Value> {
+        let mut msg = payload.to_string();
+        msg.push('\n');
+        self.writer.write_all(msg.as_bytes())?;
+        self.writer.flush()?;
+
+        loop {
+            let mut line = String::new();
+            let n = self.reader.read_line(&mut line)?;
+            if n == 0 {
+                anyhow::bail!("mpv connection closed unexpectedly");
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+                if v.get("event").is_none() {
+                    return Ok(v);
+                }
+            }
+        }
+    }
+
+    fn get_property(&mut self, name: &str) -> Value {
+        self.send(json!({ "command": ["get_property", name] }))
+            .ok()
+            .and_then(|v| v.get("data").cloned())
+            .unwrap_or(Value::Null)
+    }
+
+    fn play(&mut self, path: &Path) -> anyhow::Result<()> {
+        let path_str = path.to_string_lossy().to_string();
+        let reply = self.send(json!({ "command": ["loadfile", path_str, "replace"] }))?;
+        if reply.get("error").and_then(|e| e.as_str()) != Some("success") {
+            anyhow::bail!(
+                "{}",
+                reply
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("unknown mpv error")
+            );
+        }
+        Ok(())
+    }
+
+    fn toggle_pause(&mut self) {
+        let _ = self.send(json!({ "command": ["cycle", "pause"] }));
+    }
+
+    fn stop(&mut self) {
+        let _ = self.send(json!({ "command": ["stop"] }));
+    }
+
+    fn set_volume(&mut self, vol: f64) {
+        let vol = vol.clamp(0.0, 100.0);
+        let _ = self.send(json!({ "command": ["set_property", "volume", vol] }));
+    }
+
+    fn volume(&mut self) -> f64 {
+        self.get_property("volume").as_f64().unwrap_or(100.0)
+    }
+
+    fn seek(&mut self, seconds: f64) {
+        let _ = self.send(json!({ "command": ["seek", seconds, "relative"] }));
+    }
+
+    fn is_idle(&mut self) -> bool {
+        self.get_property("idle-active").as_bool().unwrap_or(false)
+    }
+
+    fn is_paused(&mut self) -> bool {
+        self.get_property("pause").as_bool().unwrap_or(false)
+    }
+}
+
+impl Drop for Mpv {
+    fn drop(&mut self) {
+        let _ = self.send(json!({ "command": ["quit"] }));
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_file(&self.socket_path);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// App State
+// ---------------------------------------------------------------------------
+
+struct App {
+    current_dir: PathBuf,
+    entries: Vec<Entry>,
+    selected_file: usize,
+
+    queue: Vec<PathBuf>,
+    selected_queue: usize,
+
+    mode: ViewMode,
+    mpv: Mpv,
+    current: Option<PathBuf>,
+    status: String,
+    should_quit: bool,
+    theme: Theme,
+}
+
+impl App {
+    fn new(start_dir: PathBuf) -> anyhow::Result<Self> {
+        let mpv = Mpv::spawn()?;
+        let theme = Theme::load_or_default();
+        let mut app = Self {
+            current_dir: start_dir,
+            entries: Vec::new(),
+            selected_file: 0,
+            queue: Vec::new(),
+            selected_queue: 0,
+            mode: ViewMode::Files,
+            mpv,
+            current: None,
+            status: String::new(),
+            should_quit: false,
+            theme,
+        };
+        app.refresh_entries();
+        Ok(app)
+    }
+
+    fn is_audio(path: &Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|ext| AUDIO_EXTS.contains(&ext.to_lowercase().as_str()))
+            .unwrap_or(false)
+    }
+
+    fn is_hidden(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.starts_with('.'))
+            .unwrap_or(false)
+    }
+
+    fn refresh_entries(&mut self) {
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+
+        if let Ok(read) = fs::read_dir(&self.current_dir) {
+            for e in read.flatten() {
+                let path = e.path();
+                if Self::is_hidden(&path) {
+                    continue;
+                }
+                if path.is_dir() {
+                    dirs.push(Entry { path, is_dir: true });
+                } else if Self::is_audio(&path) {
+                    files.push(Entry { path, is_dir: false });
+                }
+            }
+        }
+
+        dirs.sort_by_key(|e| e.name().to_lowercase());
+        files.sort_by_key(|e| e.name().to_lowercase());
+
+        self.entries = dirs;
+        self.entries.extend(files);
+        self.selected_file = 0;
+    }
+
+    fn move_up(&mut self) {
+        match self.mode {
+            ViewMode::Files => {
+                if self.selected_file > 0 {
+                    self.selected_file -= 1;
+                }
+            }
+            ViewMode::Queue => {
+                if self.selected_queue > 0 {
+                    self.selected_queue -= 1;
+                }
+            }
+            ViewMode::Zen => {}
+        }
+    }
+
+    fn move_down(&mut self) {
+        match self.mode {
+            ViewMode::Files => {
+                if !self.entries.is_empty() && self.selected_file + 1 < self.entries.len() {
+                    self.selected_file += 1;
+                }
+            }
+            ViewMode::Queue => {
+                if !self.queue.is_empty() && self.selected_queue + 1 < self.queue.len() {
+                    self.selected_queue += 1;
+                }
+            }
+            ViewMode::Zen => {}
+        }
+    }
+
+    fn queue_move_up(&mut self) {
+        if self.mode == ViewMode::Queue && self.selected_queue > 0 {
+            self.queue.swap(self.selected_queue, self.selected_queue - 1);
+            self.selected_queue -= 1;
+        }
+    }
+
+    fn queue_move_down(&mut self) {
+        if self.mode == ViewMode::Queue
+            && !self.queue.is_empty()
+            && self.selected_queue + 1 < self.queue.len()
+        {
+            self.queue.swap(self.selected_queue, self.selected_queue + 1);
+            self.selected_queue += 1;
+        }
+    }
+
+    fn add_selected_to_queue(&mut self) {
+        if self.mode == ViewMode::Files {
+            if let Some(entry) = self.entries.get(self.selected_file) {
+                if !entry.is_dir {
+                    self.queue.push(entry.path.clone());
+                    self.status = format!("Added to queue: {}", entry.name());
+                }
+            }
+        }
+    }
+
+    fn remove_from_queue(&mut self) {
+        if self.mode == ViewMode::Queue && !self.queue.is_empty() {
+            let removed = self.queue.remove(self.selected_queue);
+            if self.selected_queue >= self.queue.len() && !self.queue.is_empty() {
+                self.selected_queue = self.queue.len() - 1;
+            }
+            if let Some(name) = removed.file_name() {
+                self.status = format!("Removed from queue: {}", name.to_string_lossy());
+            }
+        }
+    }
+
+    fn enter_selected(&mut self) {
+        match self.mode {
+            ViewMode::Files => {
+                if let Some(entry) = self.entries.get(self.selected_file).cloned() {
+                    if entry.is_dir {
+                        self.current_dir = entry.path;
+                        self.refresh_entries();
+                    } else {
+                        self.play(&entry.path);
+                    }
+                }
+            }
+            ViewMode::Queue => {
+                if let Some(path) = self.queue.get(self.selected_queue).cloned() {
+                    self.play(&path);
+                }
+            }
+            ViewMode::Zen => {}
+        }
+    }
+
+    fn go_parent(&mut self) {
+        if self.mode == ViewMode::Files {
+            if let Some(parent) = self.current_dir.parent().map(|p| p.to_path_buf()) {
+                let old_dir = self.current_dir.clone();
+                self.current_dir = parent;
+                self.refresh_entries();
+
+                if let Some(pos) = self.entries.iter().position(|e| e.path == old_dir) {
+                    self.selected_file = pos;
+                }
+            }
+        }
+    }
+
+    fn play(&mut self, path: &Path) {
+        match self.mpv.play(path) {
+            Ok(()) => {
+                self.current = Some(path.to_path_buf());
+                self.status.clear();
+            }
+            Err(e) => {
+                self.status = format!("Error: {e}");
+            }
+        }
+    }
+
+    fn play_next(&mut self) {
+        if !self.queue.is_empty() {
+            let next_track = self.queue.remove(0);
+            if self.selected_queue >= self.queue.len() && !self.queue.is_empty() {
+                self.selected_queue = self.queue.len() - 1;
+            }
+            self.play(&next_track);
+            return;
+        }
+
+        if let Some(current) = self.current.clone() {
+            if let Some(pos) = self.entries.iter().position(|e| e.path == current) {
+                if let Some(next) = self.entries[pos + 1..].iter().find(|e| !e.is_dir) {
+                    let path = next.path.clone();
+                    if let Some(new_pos) = self.entries.iter().position(|e| e.path == path) {
+                        self.selected_file = new_pos;
+                    }
+                    self.play(&path);
+                    return;
+                }
+            }
+        }
+        self.current = None;
+        self.status = "Playback finished".to_string();
+    }
+
+    fn play_prev(&mut self) {
+        let pos = self.mpv.get_property("time-pos").as_f64().unwrap_or(0.0);
+        if pos > 3.0 {
+            self.mpv.seek(-pos);
+            return;
+        }
+
+        if let Some(current) = self.current.clone() {
+            if let Some(pos) = self.entries.iter().position(|e| e.path == current) {
+                if pos > 0 {
+                    if let Some(prev) = self.entries[..pos].iter().rev().find(|e| !e.is_dir) {
+                        let path = prev.path.clone();
+                        if let Some(new_pos) = self.entries.iter().position(|e| e.path == path) {
+                            self.selected_file = new_pos;
+                        }
+                        self.play(&path);
+                        return;
+                    }
+                }
+            }
+        }
+        self.status = "Top of list".to_string();
+    }
+
+    fn toggle_pause(&mut self) {
+        self.mpv.toggle_pause();
+    }
+
+    fn stop(&mut self) {
+        self.mpv.stop();
+        self.current = None;
+    }
+
+    fn volume_up(&mut self) {
+        let v = self.mpv.volume();
+        self.mpv.set_volume(v + 10.0);
+    }
+
+    fn volume_down(&mut self) {
+        let v = self.mpv.volume();
+        self.mpv.set_volume(v - 10.0);
+    }
+
+    fn seek_forward(&mut self) {
+        if self.current.is_some() {
+            self.mpv.seek(5.0);
+        }
+    }
+
+    fn seek_backward(&mut self) {
+        if self.current.is_some() {
+            self.mpv.seek(-5.0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn format_time(secs: f64) -> String {
+    let total = secs.max(0.0) as u64;
+    let minutes = total / 60;
+    let seconds = total % 60;
+    format!("{minutes:02}:{seconds:02}")
+}
+
+fn make_progress_bar(percent: f64, width: usize) -> String {
+    let width = width.saturating_sub(2);
+    let filled = ((percent / 100.0) * width as f64).round() as usize;
+    let filled = filled.clamp(0, width);
+    let empty = width.saturating_sub(filled);
+
+    format!("[{}{}]", "━".repeat(filled), "─".repeat(empty))
+}
+
+// ---------------------------------------------------------------------------
+// UI Drawing
+// ---------------------------------------------------------------------------
+
+fn draw(f: &mut Frame, app: &mut App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(4),
+            Constraint::Length(3),
+        ])
+        .split(f.area());
+
+    draw_header(f, app, chunks[0]);
+
+    match app.mode {
+        ViewMode::Files => draw_file_list(f, app, chunks[1]),
+        ViewMode::Queue => draw_queue_list(f, app, chunks[1]),
+        ViewMode::Zen => draw_zen_mode(f, app, chunks[1]),
+    }
+
+    if app.mode != ViewMode::Zen {
+        draw_player_status(f, app, chunks[2]);
+    } else {
+        f.render_widget(Block::default(), chunks[2]);
+    }
+
+    draw_controls_bar(f, app, chunks[3]);
+}
+
+fn draw_header(f: &mut Frame, app: &App, area: Rect) {
+    let mode_str = match app.mode {
+        ViewMode::Files => "[1: Files]",
+        ViewMode::Queue => "[2: Queue]",
+        ViewMode::Zen => "[3: Zen Mode]",
+    };
+
+    let title_text = format!(" tuiplay {} | {}", mode_str, app.current_dir.display());
+    let header = Paragraph::new(title_text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(app.theme.border))
+            .title(Span::styled(" View ", Style::default().fg(app.theme.title))),
+    );
+    f.render_widget(header, area);
+}
+
+fn draw_file_list(f: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = app
+        .entries
+        .iter()
+        .map(|e| {
+            let is_current = app.current.as_ref() == Some(&e.path);
+            let label = if e.is_dir {
+                format!("  {}/", e.name())
+            } else if is_current {
+                format!("  ▶ {}", e.name())
+            } else {
+                format!("    {}", e.name())
+            };
+
+            let style = if is_current {
+                Style::default().fg(app.theme.playing).add_modifier(Modifier::BOLD)
+            } else if e.is_dir {
+                Style::default().fg(app.theme.dir)
+            } else {
+                Style::default().fg(app.theme.text)
+            };
+
+            ListItem::new(Line::from(Span::styled(label, style)))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.border))
+                .title(Span::styled(
+                    " Directory Files (Press 'a' to queue) ",
+                    Style::default().fg(app.theme.title),
+                )),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(app.theme.highlight_bg)
+                .fg(app.theme.highlight_fg)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+
+    let mut state = ListState::default();
+    if !app.entries.is_empty() {
+        state.select(Some(app.selected_file));
+    }
+
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_queue_list(f: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = app
+        .queue
+        .iter()
+        .enumerate()
+        .map(|(idx, path)| {
+            let is_current = app.current.as_ref() == Some(path);
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.to_string_lossy().to_string());
+
+            let label = if is_current {
+                format!(" {:2}. ▶ {}", idx + 1, name)
+            } else {
+                format!(" {:2}.   {}", idx + 1, name)
+            };
+
+            let style = if is_current {
+                Style::default().fg(app.theme.playing).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(app.theme.text)
+            };
+
+            ListItem::new(Line::from(Span::styled(label, style)))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.border))
+                .title(Span::styled(
+                    format!(" Queue ({}) [Shift+J/K: move | d: remove] ", app.queue.len()),
+                    Style::default().fg(app.theme.title),
+                )),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(app.theme.highlight_bg)
+                .fg(app.theme.highlight_fg)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+
+    let mut state = ListState::default();
+    if !app.queue.is_empty() {
+        state.select(Some(app.selected_queue));
+    }
+
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_zen_mode(f: &mut Frame, app: &mut App, area: Rect) {
+    let zen_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(area);
+
+    let art_ascii = vec![
+        "  ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄  ",
+        " █                     █ ",
+        " █     ▄▄▄███▄▄▄       █ ",
+        " █   ▄███████████▄     █ ",
+        " █  █████▀▀ ▀▀█████    █ ",
+        " █  ████   ⊙   ████    █ ",
+        " █  █████▄▄ ▄▄█████    █ ",
+        " █   ▀███████████▀     █ ",
+        " █     ▀▀▀███▀▀▀       █ ",
+        " █                     █ ",
+        "  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀  ",
+    ];
+
+    let art_lines: Vec<Line> = art_ascii
+        .into_iter()
+        .map(|line| Line::from(Span::styled(line, Style::default().fg(app.theme.title))))
+        .collect();
+
+    let album_art_widget = Paragraph::new(art_lines)
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.border))
+                .title(Span::styled(" Artwork ", Style::default().fg(app.theme.title))),
+        );
+    f.render_widget(album_art_widget, zen_layout[0]);
+
+    let pos = app.mpv.get_property("time-pos").as_f64().unwrap_or(0.0);
+    let duration = app.mpv.get_property("duration").as_f64().unwrap_or(0.0);
+    let vol_pct = app.mpv.volume().round() as i32;
+
+    let track_name = app
+        .current
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "No Track Playing".to_string());
+
+    let album_or_folder = app
+        .current
+        .as_ref()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Unknown Album".to_string());
+
+    let play_state = if app.current.is_none() {
+        "⏹ STOPPED"
+    } else if app.mpv.is_paused() {
+        "⏸ PAUSED"
+    } else {
+        "▶ PLAYING"
+    };
+
+    let pos_str = format_time(pos);
+    let dur_str = format_time(duration);
+    let pct = if duration > 0.0 { (pos / duration) * 100.0 } else { 0.0 };
+
+    let bar_width = (zen_layout[1].width as usize).saturating_sub(18).max(10);
+    let progress_bar = make_progress_bar(pct, bar_width);
+
+    let meta_lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Track:  ", Style::default().fg(app.theme.title)),
+            Span::styled(track_name, Style::default().fg(app.theme.playing).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Album:  ", Style::default().fg(app.theme.title)),
+            Span::styled(album_or_folder, Style::default().fg(app.theme.text)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Status: ", Style::default().fg(app.theme.title)),
+            Span::styled(play_state, Style::default().fg(app.theme.dir).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("   [Vol: {vol_pct}%]"), Style::default().fg(app.theme.volume)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Timeline:", Style::default().fg(app.theme.title)),
+        ]),
+        Line::from(vec![
+            Span::styled(format!(" {pos_str} "), Style::default().fg(app.theme.text)),
+            Span::styled(progress_bar, Style::default().fg(app.theme.playing)),
+            Span::styled(format!(" {dur_str}"), Style::default().fg(app.theme.text)),
+        ]),
+    ];
+
+    let metadata_widget = Paragraph::new(meta_lines)
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.border))
+                .title(Span::styled(" Now Playing (Zen Mode) ", Style::default().fg(app.theme.title))),
+        );
+
+    f.render_widget(metadata_widget, zen_layout[1]);
+}
+
+fn draw_player_status(f: &mut Frame, app: &mut App, area: Rect) {
+    if app.current.is_none() {
+        let empty_msg = Paragraph::new(" No track selected").block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.border))
+                .title(Span::styled(" Now Playing ", Style::default().fg(app.theme.title))),
+        );
+        f.render_widget(empty_msg, area);
+        return;
+    }
+
+    let pos = app.mpv.get_property("time-pos").as_f64().unwrap_or(0.0);
+    let duration = app.mpv.get_property("duration").as_f64().unwrap_or(0.0);
+
+    let pos_str = format_time(pos);
+    let dur_str = format_time(duration);
+
+    let pct = if duration > 0.0 {
+        (pos / duration) * 100.0
+    } else {
+        0.0
+    };
+
+    let track_name = app
+        .current
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let vol_pct = app.mpv.volume().round() as i32;
+
+    let line1 = Line::from(vec![
+        Span::styled(
+            format!(" ♪ {track_name}"),
+            Style::default().fg(app.theme.playing).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("   [Vol: {vol_pct}%]"), Style::default().fg(app.theme.volume)),
+    ]);
+
+    let bar_width = (area.width as usize).saturating_sub(20).max(10);
+    let bar = make_progress_bar(pct, bar_width);
+    let line2 = Line::from(format!(" {pos_str} {bar} {dur_str}"));
+
+    let paragraph = Paragraph::new(vec![line1, line2]).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(app.theme.border))
+            .title(Span::styled(" Now Playing ", Style::default().fg(app.theme.title))),
+    );
+
+    f.render_widget(paragraph, area);
+}
+
+fn draw_controls_bar(f: &mut Frame, app: &mut App, area: Rect) {
+    let play_state = if app.current.is_none() {
+        "STOPPED"
+    } else if app.mpv.is_paused() {
+        "PAUSED"
+    } else {
+        "PLAYING"
+    };
+
+    let status_msg = if app.status.is_empty() {
+        String::new()
+    } else {
+        format!(" | {}", app.status)
+    };
+
+    let text = format!(
+        "[{play_state}]{status_msg}  1/2/3: views | Shift+←/→: skip | ←/→: seek | space: pause | q: quit"
+    );
+
+    let bar = Paragraph::new(text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(app.theme.border))
+            .title(Span::styled(" Controls ", Style::default().fg(app.theme.title))),
+    );
+    f.render_widget(bar, area);
+}
+
+// ---------------------------------------------------------------------------
+// Main Loop & Event Handling
+// ---------------------------------------------------------------------------
+
+fn main() -> anyhow::Result<()> {
+    let start_dir = env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            env::var("HOME")
+                .ok()
+                .map(|home| PathBuf::from(home).join("Music"))
+                .filter(|path| path.is_dir())
+                .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        });
+
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut app = App::new(start_dir)?;
+    let result = run(&mut terminal, &mut app);
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+fn run<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+) -> anyhow::Result<()> {
+    loop {
+        terminal.draw(|f| draw(f, app))?;
+
+        if event::poll(Duration::from_millis(150))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    handle_key(app, key);
+                }
+            }
+        }
+
+        if app.current.is_some() && app.mpv.is_idle() {
+            app.play_next();
+        }
+
+        if app.should_quit {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn handle_key(app: &mut App, key: KeyEvent) {
+    let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+
+        // Media Key Support (crossterm)
+        KeyCode::Media(media_event) => match media_event {
+            MediaKeyCode::Play | MediaKeyCode::Pause | MediaKeyCode::PlayPause => {
+                app.toggle_pause();
+            }
+            MediaKeyCode::TrackNext => app.play_next(),
+            MediaKeyCode::TrackPrevious => app.play_prev(),
+            MediaKeyCode::Stop => app.stop(),
+            _ => {}
+        },
+
+        // Mode Switching
+        KeyCode::Char('1') => app.mode = ViewMode::Files,
+        KeyCode::Char('2') => app.mode = ViewMode::Queue,
+        KeyCode::Char('3') => app.mode = ViewMode::Zen,
+
+        // Reordering in Queue mode
+        KeyCode::Char('J') => app.queue_move_down(),
+        KeyCode::Char('K') => app.queue_move_up(),
+
+        // Queue operations
+        KeyCode::Char('a') => app.add_selected_to_queue(),
+        KeyCode::Char('d') => app.remove_from_queue(),
+
+        // Navigation
+        KeyCode::Char('j') | KeyCode::Down => app.move_down(),
+        KeyCode::Char('k') | KeyCode::Up => app.move_up(),
+        KeyCode::Char('l') | KeyCode::Enter => app.enter_selected(),
+        KeyCode::Char('h') => app.go_parent(),
+
+        // Seeking & Skipping Tracks
+        KeyCode::Right => {
+            if has_shift {
+                app.play_next();
+            } else {
+                app.seek_forward();
+            }
+        }
+        KeyCode::Left => {
+            if has_shift {
+                app.play_prev();
+            } else {
+                app.seek_backward();
+            }
+        }
+
+        // Playback Controls
+        KeyCode::Char(' ') => app.toggle_pause(),
+        KeyCode::Char('s') => app.stop(),
+        KeyCode::Char('n') => app.play_next(),
+        KeyCode::Char('p') => app.play_prev(),
+        KeyCode::Char('+') | KeyCode::Char('=') => app.volume_up(),
+        KeyCode::Char('-') | KeyCode::Char('_') => app.volume_down(),
+        _ => {}
+    }
+}

@@ -1,0 +1,15 @@
+[package]
+name = "tuiplay"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.28"
+ratatui = "0.28"
+serde_json = "1"
+image = "0.25"
+ratatui-image = "3.0"
+id3 = "1.14"
+souvlaki = "0.8"
+
