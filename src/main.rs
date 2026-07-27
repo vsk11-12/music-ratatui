@@ -13,6 +13,8 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use lofty::prelude::*;
+use lofty::probe::Probe;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -20,6 +22,11 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
+};
+use ratatui_image::{
+    picker::Picker,
+    protocol::StatefulProtocol,
+    StatefulImage,
 };
 use serde_json::{json, Value};
 use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPosition, PlatformConfig};
@@ -134,6 +141,17 @@ impl Theme {
             volume: parse_hex_color("#5bc0be"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Artwork Helper
+// ---------------------------------------------------------------------------
+
+fn extract_album_art(path: &Path) -> Option<image::DynamicImage> {
+    let tagged_file = Probe::open(path).ok()?.read().ok()?;
+    let tag = tagged_file.primary_tag().or_else(|| tagged_file.first_tag())?;
+    let picture = tag.pictures().first()?;
+    image::load_from_memory(picture.data()).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +345,9 @@ struct App {
     show_quit_popup: bool,
     theme: Theme,
 
+    picker: Picker,
+    current_artwork: Option<StatefulProtocol>,
+
     controls: Option<MediaControls>,
     action_rx: Receiver<AppAction>,
 }
@@ -338,6 +359,8 @@ impl App {
         let (tx, rx) = channel();
 
         let controls = Self::init_media_controls(tx);
+        let picker = Picker::from_query_stdio()
+            .unwrap_or_else(|_| Picker::from_fontsize((8, 12)));
 
         let mut app = Self {
             current_dir: start_dir,
@@ -352,6 +375,8 @@ impl App {
             should_quit: false,
             show_quit_popup: false,
             theme,
+            picker,
+            current_artwork: None,
             controls,
             action_rx: rx,
         };
@@ -573,6 +598,12 @@ impl App {
                 self.current = Some(path.to_path_buf());
                 self.status.clear();
                 self.update_media_metadata(path);
+
+                if let Some(img) = extract_album_art(path) {
+                    self.current_artwork = Some(self.picker.new_resize_protocol(img));
+                } else {
+                    self.current_artwork = None;
+                }
             }
             Err(e) => {
                 self.status = format!("Error: {e}");
@@ -603,6 +634,7 @@ impl App {
             }
         }
         self.current = None;
+        self.current_artwork = None;
         self.status = "Playback finished".to_string();
         if let Some(ref mut controls) = self.controls {
             let _ = controls.set_playback(souvlaki::MediaPlayback::Stopped);
@@ -651,6 +683,7 @@ impl App {
     fn stop(&mut self) {
         self.mpv.stop();
         self.current = None;
+        self.current_artwork = None;
         if let Some(ref mut controls) = self.controls {
             let _ = controls.set_playback(souvlaki::MediaPlayback::Stopped);
         }
@@ -899,34 +932,40 @@ fn draw_zen_mode(f: &mut Frame, app: &mut App, area: Rect) {
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
 
-    let art_ascii = vec![
-        "  ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄  ",
-        " █                     █ ",
-        " █     ▄▄▄███▄▄▄       █ ",
-        " █   ▄███████████▄     █ ",
-        " █  █████▀▀ ▀▀█████    █ ",
-        " █  ████   ⊙   ████    █ ",
-        " █  █████▄▄ ▄▄█████    █ ",
-        " █   ▀███████████▀     █ ",
-        " █     ▀▀▀███▀▀▀       █ ",
-        " █                     █ ",
-        "  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀  ",
-    ];
+    let art_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.border))
+        .title(Span::styled(" Artwork ", Style::default().fg(app.theme.title)));
 
-    let art_lines: Vec<Line> = art_ascii
-        .into_iter()
-        .map(|line| Line::from(Span::styled(line, Style::default().fg(app.theme.title))))
-        .collect();
+    let inner_art_area = art_block.inner(zen_layout[0]);
+    f.render_widget(art_block, zen_layout[0]);
 
-    let album_art_widget = Paragraph::new(art_lines)
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(app.theme.border))
-                .title(Span::styled(" Artwork ", Style::default().fg(app.theme.title))),
-        );
-    f.render_widget(album_art_widget, zen_layout[0]);
+    if let Some(ref mut protocol) = app.current_artwork {
+        let image_widget = StatefulImage::new(None);
+        f.render_stateful_widget(image_widget, inner_art_area, protocol);
+    } else {
+        let art_ascii = vec![
+            "  ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄  ",
+            " █                     █ ",
+            " █     ▄▄▄███▄▄▄       █ ",
+            " █   ▄███████████▄     █ ",
+            " █  █████▀▀ ▀▀█████    █ ",
+            " █  ████   ⊙   ████    █ ",
+            " █  █████▄▄ ▄▄█████    █ ",
+            " █   ▀███████████▀     █ ",
+            " █     ▀▀▀███▀▀▀       █ ",
+            " █                     █ ",
+            "  ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀  ",
+        ];
+
+        let art_lines: Vec<Line> = art_ascii
+            .into_iter()
+            .map(|line| Line::from(Span::styled(line, Style::default().fg(app.theme.title))))
+            .collect();
+
+        let album_art_widget = Paragraph::new(art_lines).alignment(Alignment::Center);
+        f.render_widget(album_art_widget, inner_art_area);
+    }
 
     let pos = app.mpv.get_property("time-pos").as_f64().unwrap_or(0.0);
     let duration = app.mpv.get_property("duration").as_f64().unwrap_or(0.0);
@@ -1204,7 +1243,6 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.show_quit_popup = true,
 
-        // Media key events
         KeyCode::Media(media_event) => match media_event {
             MediaKeyCode::Play | MediaKeyCode::Pause | MediaKeyCode::PlayPause => {
                 app.toggle_pause();
@@ -1215,26 +1253,21 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             _ => {}
         },
 
-        // View Mode Switching
         KeyCode::Char('1') => app.mode = ViewMode::Files,
         KeyCode::Char('2') => app.mode = ViewMode::Queue,
         KeyCode::Char('3') => app.mode = ViewMode::Zen,
 
-        // Queue Item Reordering
         KeyCode::Char('J') => app.queue_move_down(),
         KeyCode::Char('K') => app.queue_move_up(),
 
-        // Queue Operations
         KeyCode::Char('a') => app.add_selected_to_queue(),
         KeyCode::Char('d') => app.remove_from_queue(),
 
-        // Navigation
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
         KeyCode::Char('l') | KeyCode::Enter => app.enter_selected(),
         KeyCode::Char('h') => app.go_parent(),
 
-        // Seeking & Skipping Tracks
         KeyCode::Right => {
             if has_shift {
                 app.play_next();
@@ -1250,7 +1283,6 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             }
         }
 
-        // Playback Control
         KeyCode::Char(' ') => app.toggle_pause(),
         KeyCode::Char('s') => app.stop(),
         KeyCode::Char('n') => app.play_next(),
