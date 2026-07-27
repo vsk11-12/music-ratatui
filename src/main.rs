@@ -18,7 +18,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
 use serde_json::{json, Value};
@@ -258,7 +258,6 @@ impl Mpv {
             );
         }
 
-        // Poll mpv until idle-active becomes false so the main loop doesn't instantly double-trigger play_next()
         for _ in 0..20 {
             std::thread::sleep(Duration::from_millis(50));
             if !self.is_idle() {
@@ -325,6 +324,7 @@ struct App {
     current: Option<PathBuf>,
     status: String,
     should_quit: bool,
+    show_quit_popup: bool,
     theme: Theme,
 
     controls: Option<MediaControls>,
@@ -350,6 +350,7 @@ impl App {
             current: None,
             status: String::new(),
             should_quit: false,
+            show_quit_popup: false,
             theme,
             controls,
             action_rx: rx,
@@ -485,7 +486,6 @@ impl App {
                 if !entry.is_dir {
                     self.queue.push(entry.path.clone());
                     self.status = format!("Added to queue: {}", entry.name());
-                    // Auto-advance selection down after queueing
                     self.move_down();
                 }
             }
@@ -512,12 +512,10 @@ impl App {
                         self.current_dir = entry.path;
                         self.refresh_entries();
                     } else if self.current.is_some() {
-                        // Queue song and auto-advance cursor
                         self.queue.push(entry.path.clone());
                         self.status = format!("Added to queue: {}", entry.name());
                         self.move_down();
                     } else {
-                        // Start playing immediately if idle
                         self.play(&entry.path);
                     }
                 }
@@ -712,6 +710,26 @@ fn make_progress_bar(percent: f64, width: usize) -> String {
     format!("[{}{}]", "━".repeat(filled), "─".repeat(empty))
 }
 
+fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(height),
+            Constraint::Fill(1),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(width),
+            Constraint::Fill(1),
+        ])
+        .split(vertical[1])[1]
+}
+
 // ---------------------------------------------------------------------------
 // UI Drawing
 // ---------------------------------------------------------------------------
@@ -742,6 +760,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
 
     draw_controls_bar(f, app, chunks[3]);
+
+    if app.show_quit_popup {
+        draw_quit_popup(f, app);
+    }
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -1073,6 +1095,36 @@ fn draw_controls_bar(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(bar, area);
 }
 
+fn draw_quit_popup(f: &mut Frame, app: &App) {
+    let popup_area = centered_rect(44, 7, f.area());
+    f.render_widget(Clear, popup_area);
+
+    let popup_block = Block::default()
+        .title(Span::styled(" Quit Confirmation ", Style::default().fg(app.theme.title)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.border));
+
+    let content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Are you sure you want to quit?",
+            Style::default().fg(app.theme.text).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" [Y] Yes ", Style::default().fg(app.theme.playing).add_modifier(Modifier::BOLD)),
+            Span::raw("    "),
+            Span::styled(" [N] No ", Style::default().fg(app.theme.title).add_modifier(Modifier::BOLD)),
+        ]),
+    ];
+
+    let popup_paragraph = Paragraph::new(content)
+        .alignment(Alignment::Center)
+        .block(popup_block);
+
+    f.render_widget(popup_paragraph, popup_area);
+}
+
 // ---------------------------------------------------------------------------
 // Main Loop & Event Handling
 // ---------------------------------------------------------------------------
@@ -1122,7 +1174,6 @@ fn run<B: ratatui::backend::Backend>(
 
         app.process_external_actions();
 
-        // Check if playback finished and mpv went idle
         if app.current.is_some() && app.mpv.is_idle() {
             app.play_next();
         }
@@ -1135,10 +1186,23 @@ fn run<B: ratatui::backend::Backend>(
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
+    if app.show_quit_popup {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                app.should_quit = true;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                app.show_quit_popup = false;
+            }
+            _ => {}
+        }
+        return;
+    }
+
     let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Char('q') | KeyCode::Esc => app.show_quit_popup = true,
 
         // Media key events
         KeyCode::Media(media_event) => match media_event {
