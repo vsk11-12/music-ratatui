@@ -5,7 +5,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use crossterm::{
@@ -157,13 +157,12 @@ impl Mpv {
         cmd.arg("--idle=yes")
             .arg("--no-video")
             .arg("--no-terminal")
-            .arg("--no-config")          // Prevents user mpv.conf from forcing loop=inf
-            .arg("--loop-file=no")       // Disables single file looping
+            .arg("--no-config")
+            .arg("--loop-file=no")
             .arg("--loop-playlist=no")
             .arg("--really-quiet")
             .arg(format!("--input-ipc-server={}", socket_path.display()));
 
-        // Check common locations for the mpv-mpris C-plugin
         let candidate_mpris_paths = [
             PathBuf::from("/usr/lib/mpv/mpris.so"),
             PathBuf::from("/usr/lib64/mpv/mpris.so"),
@@ -187,11 +186,11 @@ impl Mpv {
         let mut connected = None;
         for _ in 0..50 {
             if let Ok(s) = UnixStream::connect(&socket_path) {
-                let _ = s.set_read_timeout(Some(Duration::from_millis(150)));
+                let _ = s.set_read_timeout(Some(Duration::from_millis(100)));
                 connected = Some(s);
                 break;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(50));
         }
         let writer = connected.context("mpv did not open its IPC socket in time")?;
         let reader = BufReader::new(writer.try_clone()?);
@@ -210,20 +209,31 @@ impl Mpv {
         self.writer.write_all(msg.as_bytes())?;
         self.writer.flush()?;
 
+        let start = Instant::now();
         loop {
             let mut line = String::new();
-            let n = self.reader.read_line(&mut line)?;
-            if n == 0 {
-                anyhow::bail!("mpv connection closed unexpectedly");
-            }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-                if v.get("event").is_none() {
-                    return Ok(v);
+            match self.reader.read_line(&mut line) {
+                Ok(0) => anyhow::bail!("mpv connection closed unexpectedly"),
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+                        if v.get("event").is_none() {
+                            return Ok(v);
+                        }
+                    }
                 }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    if start.elapsed() > Duration::from_millis(500) {
+                        anyhow::bail!("mpv socket read timed out");
+                    }
+                }
+                Err(e) => return Err(e.into()),
             }
         }
     }
@@ -247,6 +257,15 @@ impl Mpv {
                     .unwrap_or("unknown mpv error")
             );
         }
+
+        // Poll mpv until idle-active becomes false so the main loop doesn't instantly double-trigger play_next()
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(50));
+            if !self.is_idle() {
+                break;
+            }
+        }
+
         Ok(())
     }
 
@@ -466,6 +485,8 @@ impl App {
                 if !entry.is_dir {
                     self.queue.push(entry.path.clone());
                     self.status = format!("Added to queue: {}", entry.name());
+                    // Auto-advance selection down after queueing
+                    self.move_down();
                 }
             }
         }
@@ -490,7 +511,13 @@ impl App {
                     if entry.is_dir {
                         self.current_dir = entry.path;
                         self.refresh_entries();
+                    } else if self.current.is_some() {
+                        // Queue song and auto-advance cursor
+                        self.queue.push(entry.path.clone());
+                        self.status = format!("Added to queue: {}", entry.name());
+                        self.move_down();
                     } else {
+                        // Start playing immediately if idle
                         self.play(&entry.path);
                     }
                 }
@@ -749,7 +776,9 @@ fn draw_file_list(f: &mut Frame, app: &App, area: Rect) {
             };
 
             let style = if is_current {
-                Style::default().fg(app.theme.playing).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(app.theme.playing)
+                    .add_modifier(Modifier::BOLD)
             } else if e.is_dir {
                 Style::default().fg(app.theme.dir)
             } else {
@@ -805,7 +834,9 @@ fn draw_queue_list(f: &mut Frame, app: &App, area: Rect) {
             };
 
             let style = if is_current {
-                Style::default().fg(app.theme.playing).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(app.theme.playing)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(app.theme.text)
             };
@@ -913,7 +944,12 @@ fn draw_zen_mode(f: &mut Frame, app: &mut App, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::styled(" Track:  ", Style::default().fg(app.theme.title)),
-            Span::styled(track_name, Style::default().fg(app.theme.playing).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                track_name,
+                Style::default()
+                    .fg(app.theme.playing)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
             Span::styled(" Album:  ", Style::default().fg(app.theme.title)),
@@ -921,7 +957,12 @@ fn draw_zen_mode(f: &mut Frame, app: &mut App, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled(" Status: ", Style::default().fg(app.theme.title)),
-            Span::styled(play_state, Style::default().fg(app.theme.dir).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                play_state,
+                Style::default()
+                    .fg(app.theme.dir)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(format!("   [Vol: {vol_pct}%]"), Style::default().fg(app.theme.volume)),
         ]),
         Line::from(""),
@@ -983,7 +1024,9 @@ fn draw_player_status(f: &mut Frame, app: &mut App, area: Rect) {
     let line1 = Line::from(vec![
         Span::styled(
             format!(" ♪ {track_name}"),
-            Style::default().fg(app.theme.playing).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(app.theme.playing)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("   [Vol: {vol_pct}%]"), Style::default().fg(app.theme.volume)),
     ]);
@@ -1082,8 +1125,6 @@ fn run<B: ratatui::backend::Backend>(
         // Check if playback finished and mpv went idle
         if app.current.is_some() && app.mpv.is_idle() {
             app.play_next();
-            // Sleep briefly to allow mpv to clear its idle status after loadfile
-            std::thread::sleep(Duration::from_millis(100));
         }
 
         if app.should_quit {
@@ -1099,7 +1140,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
 
-        // Crossterm focused media keys
+        // Media key events
         KeyCode::Media(media_event) => match media_event {
             MediaKeyCode::Play | MediaKeyCode::Pause | MediaKeyCode::PlayPause => {
                 app.toggle_pause();
@@ -1110,16 +1151,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             _ => {}
         },
 
-        // Mode Switching
+        // View Mode Switching
         KeyCode::Char('1') => app.mode = ViewMode::Files,
         KeyCode::Char('2') => app.mode = ViewMode::Queue,
         KeyCode::Char('3') => app.mode = ViewMode::Zen,
 
-        // Reordering in Queue mode
+        // Queue Item Reordering
         KeyCode::Char('J') => app.queue_move_down(),
         KeyCode::Char('K') => app.queue_move_up(),
 
-        // Queue operations
+        // Queue Operations
         KeyCode::Char('a') => app.add_selected_to_queue(),
         KeyCode::Char('d') => app.remove_from_queue(),
 
@@ -1145,7 +1186,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             }
         }
 
-        // Playback Controls
+        // Playback Control
         KeyCode::Char(' ') => app.toggle_pause(),
         KeyCode::Char('s') => app.stop(),
         KeyCode::Char('n') => app.play_next(),
