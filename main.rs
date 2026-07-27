@@ -4,6 +4,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -21,10 +22,19 @@ use ratatui::{
     Frame, Terminal,
 };
 use serde_json::{json, Value};
+use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPosition, PlatformConfig};
 
 const AUDIO_EXTS: &[&str] = &[
     "mp3", "flac", "ogg", "wav", "m4a", "aac", "opus", "wma", "aiff", "alac",
 ];
+
+#[derive(Debug)]
+enum AppAction {
+    TogglePause,
+    Next,
+    Prev,
+    Stop,
+}
 
 // ---------------------------------------------------------------------------
 // Views & Entry
@@ -53,7 +63,7 @@ impl Entry {
 }
 
 // ---------------------------------------------------------------------------
-// Theme & Colors (Defaults to Midnight Teal)
+// Theme & Colors
 // ---------------------------------------------------------------------------
 
 fn parse_hex_color(hex: &str) -> Color {
@@ -113,7 +123,6 @@ impl Theme {
             }
         }
 
-        // Midnight Teal Fallback Theme
         Self {
             border: parse_hex_color("#008080"),
             title: parse_hex_color("#70eceb"),
@@ -151,9 +160,17 @@ impl Mpv {
             .arg("--really-quiet")
             .arg(format!("--input-ipc-server={}", socket_path.display()));
 
-        // Enable MPRIS plugin if installed on Arch Linux (/usr/lib/mpv/mpris.so)
-        let mpris_plugin = Path::new("/usr/lib/mpv/mpris.so");
-        if mpris_plugin.exists() {
+        // Check common locations for the mpv-mpris C-plugin
+        let candidate_mpris_paths = [
+            PathBuf::from("/usr/lib/mpv/mpris.so"),
+            PathBuf::from("/usr/lib64/mpv/mpris.so"),
+            PathBuf::from("/usr/local/lib/mpv/mpris.so"),
+            env::var("HOME")
+                .map(|h| PathBuf::from(h).join(".config/mpv/scripts/mpris.so"))
+                .unwrap_or_default(),
+        ];
+
+        if let Some(mpris_plugin) = candidate_mpris_paths.iter().find(|p| p.exists()) {
             cmd.arg(format!("--script={}", mpris_plugin.display()));
         }
 
@@ -287,12 +304,19 @@ struct App {
     status: String,
     should_quit: bool,
     theme: Theme,
+
+    controls: Option<MediaControls>,
+    action_rx: Receiver<AppAction>,
 }
 
 impl App {
     fn new(start_dir: PathBuf) -> anyhow::Result<Self> {
         let mpv = Mpv::spawn()?;
         let theme = Theme::load_or_default();
+        let (tx, rx) = channel();
+
+        let controls = Self::init_media_controls(tx);
+
         let mut app = Self {
             current_dir: start_dir,
             entries: Vec::new(),
@@ -305,9 +329,43 @@ impl App {
             status: String::new(),
             should_quit: false,
             theme,
+            controls,
+            action_rx: rx,
         };
         app.refresh_entries();
         Ok(app)
+    }
+
+    fn init_media_controls(tx: Sender<AppAction>) -> Option<MediaControls> {
+        let config = PlatformConfig {
+            dbus_name: "tuiplay",
+            display_name: "tuiplay",
+            hwnd: None,
+        };
+
+        let mut controls = MediaControls::new(config).ok()?;
+
+        controls
+            .attach(move |event| match event {
+                MediaControlEvent::Play
+                | MediaControlEvent::Pause
+                | MediaControlEvent::Toggle => {
+                    let _ = tx.send(AppAction::TogglePause);
+                }
+                MediaControlEvent::Next => {
+                    let _ = tx.send(AppAction::Next);
+                }
+                MediaControlEvent::Previous => {
+                    let _ = tx.send(AppAction::Prev);
+                }
+                MediaControlEvent::Stop => {
+                    let _ = tx.send(AppAction::Stop);
+                }
+                _ => {}
+            })
+            .ok()?;
+
+        Some(controls)
     }
 
     fn is_audio(path: &Path) -> bool {
@@ -457,11 +515,36 @@ impl App {
         }
     }
 
+    fn update_media_metadata(&mut self, path: &Path) {
+        if let Some(ref mut controls) = self.controls {
+            let title = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Unknown Track".to_string());
+
+            let album = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|s| s.to_string_lossy().to_string());
+
+            let _ = controls.set_metadata(MediaMetadata {
+                title: Some(&title),
+                album: album.as_deref(),
+                ..Default::default()
+            });
+
+            let _ = controls.set_playback(souvlaki::MediaPlayback::Playing {
+                progress: Some(MediaPosition(Duration::from_secs(0))),
+            });
+        }
+    }
+
     fn play(&mut self, path: &Path) {
         match self.mpv.play(path) {
             Ok(()) => {
                 self.current = Some(path.to_path_buf());
                 self.status.clear();
+                self.update_media_metadata(path);
             }
             Err(e) => {
                 self.status = format!("Error: {e}");
@@ -493,6 +576,9 @@ impl App {
         }
         self.current = None;
         self.status = "Playback finished".to_string();
+        if let Some(ref mut controls) = self.controls {
+            let _ = controls.set_playback(souvlaki::MediaPlayback::Stopped);
+        }
     }
 
     fn play_prev(&mut self) {
@@ -521,11 +607,25 @@ impl App {
 
     fn toggle_pause(&mut self) {
         self.mpv.toggle_pause();
+        if let Some(ref mut controls) = self.controls {
+            let is_paused = self.mpv.is_paused();
+            let pos_secs = self.mpv.get_property("time-pos").as_f64().unwrap_or(0.0);
+            let progress = Some(MediaPosition(Duration::from_secs_f64(pos_secs)));
+
+            if is_paused {
+                let _ = controls.set_playback(souvlaki::MediaPlayback::Paused { progress });
+            } else {
+                let _ = controls.set_playback(souvlaki::MediaPlayback::Playing { progress });
+            }
+        }
     }
 
     fn stop(&mut self) {
         self.mpv.stop();
         self.current = None;
+        if let Some(ref mut controls) = self.controls {
+            let _ = controls.set_playback(souvlaki::MediaPlayback::Stopped);
+        }
     }
 
     fn volume_up(&mut self) {
@@ -547,6 +647,17 @@ impl App {
     fn seek_backward(&mut self) {
         if self.current.is_some() {
             self.mpv.seek(-5.0);
+        }
+    }
+
+    fn process_external_actions(&mut self) {
+        while let Ok(action) = self.action_rx.try_recv() {
+            match action {
+                AppAction::TogglePause => self.toggle_pause(),
+                AppAction::Next => self.play_next(),
+                AppAction::Prev => self.play_prev(),
+                AppAction::Stop => self.stop(),
+            }
         }
     }
 }
@@ -963,6 +1074,8 @@ fn run<B: ratatui::backend::Backend>(
             }
         }
 
+        app.process_external_actions();
+
         if app.current.is_some() && app.mpv.is_idle() {
             app.play_next();
         }
@@ -980,7 +1093,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
 
-        // Media Key Support (crossterm)
+        // Crossterm focused media keys
         KeyCode::Media(media_event) => match media_event {
             MediaKeyCode::Play | MediaKeyCode::Pause | MediaKeyCode::PlayPause => {
                 app.toggle_pause();
