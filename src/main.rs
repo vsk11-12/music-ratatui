@@ -157,6 +157,9 @@ impl Mpv {
         cmd.arg("--idle=yes")
             .arg("--no-video")
             .arg("--no-terminal")
+            .arg("--no-config")          // Prevents user mpv.conf from forcing loop=inf
+            .arg("--loop-file=no")       // Disables single file looping
+            .arg("--loop-playlist=no")
             .arg("--really-quiet")
             .arg(format!("--input-ipc-server={}", socket_path.display()));
 
@@ -1076,8 +1079,11 @@ fn run<B: ratatui::backend::Backend>(
 
         app.process_external_actions();
 
+        // Check if playback finished and mpv went idle
         if app.current.is_some() && app.mpv.is_idle() {
             app.play_next();
+            // Sleep briefly to allow mpv to clear its idle status after loadfile
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         if app.should_quit {
