@@ -4,12 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1"
+anyhow = "1.0"
 crossterm = "0.28"
-ratatui = "0.28"
-serde_json = "1"
+ratatui = "0.29"
+serde_json = "1.0"
+souvlaki = "0.7"
 image = "0.25"
+lofty = "0.21"
 ratatui-image = "3.0"
-id3 = "1.14"
-souvlaki = "0.8"
-
