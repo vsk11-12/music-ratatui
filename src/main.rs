@@ -17,17 +17,16 @@ use lofty::prelude::*;
 use lofty::probe::Probe;
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Wrap,
+    },
     Frame, Terminal,
 };
-use ratatui_image::{
-    picker::Picker,
-    protocol::StatefulProtocol,
-    StatefulImage,
-};
+use ratatui_image::{picker::Picker, protocol::StatefulProtocol, StatefulImage};
 use serde_json::{json, Value};
 use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPosition, PlatformConfig};
 
@@ -801,17 +800,28 @@ fn draw(f: &mut Frame, app: &mut App) {
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let mode_str = match app.mode {
-        ViewMode::Files => "[1: Files]",
-        ViewMode::Queue => "[2: Queue]",
-        ViewMode::Zen => "[3: Zen Mode]",
+        ViewMode::Files => "1: Files",
+        ViewMode::Queue => "2: Queue",
+        ViewMode::Zen => "3: Zen",
     };
 
-    let title_text = format!(" tuiplay {} | {}", mode_str, app.current_dir.display());
+    let title_text = Line::from(vec![
+        Span::styled(" View: ", Style::default().fg(app.theme.title)),
+        Span::styled(
+            format!("[{mode_str}]"),
+            Style::default()
+                .fg(app.theme.playing)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" | "),
+        Span::styled(app.current_dir.display().to_string(), Style::default().fg(app.theme.text)),
+    ]);
+
     let header = Paragraph::new(title_text).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(app.theme.border))
-            .title(Span::styled(" View ", Style::default().fg(app.theme.title))),
+            .title(Span::styled(" tuiplay ", Style::default().fg(app.theme.title))),
     );
     f.render_widget(header, area);
 }
@@ -823,11 +833,11 @@ fn draw_file_list(f: &mut Frame, app: &App, area: Rect) {
         .map(|e| {
             let is_current = app.current.as_ref() == Some(&e.path);
             let label = if e.is_dir {
-                format!("  {}/", e.name())
+                format!("  📁 {}/", e.name())
             } else if is_current {
-                format!("  ▶ {}", e.name())
+                format!("  ▶  {}", e.name())
             } else {
-                format!("    {}", e.name())
+                format!("     {}", e.name())
             };
 
             let style = if is_current {
@@ -868,6 +878,29 @@ fn draw_file_list(f: &mut Frame, app: &App, area: Rect) {
     }
 
     f.render_stateful_widget(list, area, &mut state);
+
+    // Vertical Scrollbar (as seen in todo-ratatui)
+    if !app.entries.is_empty() {
+        let scrollbar = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓"))
+            .track_symbol(Some("│"))
+            .thumb_symbol("█")
+            .style(Style::default().fg(app.theme.border));
+
+        let mut scrollbar_state =
+            ScrollbarState::new(app.entries.len().saturating_sub(1)).position(app.selected_file);
+
+        f.render_stateful_widget(
+            scrollbar,
+            area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut scrollbar_state,
+        );
+    }
 }
 
 fn draw_queue_list(f: &mut Frame, app: &App, area: Rect) {
@@ -924,6 +957,29 @@ fn draw_queue_list(f: &mut Frame, app: &App, area: Rect) {
     }
 
     f.render_stateful_widget(list, area, &mut state);
+
+    // Vertical Scrollbar for Queue
+    if !app.queue.is_empty() {
+        let scrollbar = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓"))
+            .track_symbol(Some("│"))
+            .thumb_symbol("█")
+            .style(Style::default().fg(app.theme.border));
+
+        let mut scrollbar_state =
+            ScrollbarState::new(app.queue.len().saturating_sub(1)).position(app.selected_queue);
+
+        f.render_stateful_widget(
+            scrollbar,
+            area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut scrollbar_state,
+        );
+    }
 }
 
 fn draw_zen_mode(f: &mut Frame, app: &mut App, area: Rect) {
@@ -1121,11 +1177,28 @@ fn draw_controls_bar(f: &mut Frame, app: &mut App, area: Rect) {
         format!(" | {}", app.status)
     };
 
-    let text = format!(
-        "[{play_state}]{status_msg}  1/2/3: views | Shift+←/→: skip | ←/→: seek | space: pause | q: quit"
-    );
+    let dim_style = Style::default().fg(app.theme.text);
+    let key_style = Style::default().fg(app.theme.title).add_modifier(Modifier::BOLD);
 
-    let bar = Paragraph::new(text).block(
+    let controls_text = Line::from(vec![
+        Span::styled(format!("[{play_state}]{status_msg}  "), Style::default().fg(app.theme.playing)),
+        Span::styled("[1/2/3]", key_style),
+        Span::styled(" Views  |  ", dim_style),
+        Span::styled("[j/k]", key_style),
+        Span::styled(" Nav  |  ", dim_style),
+        Span::styled("[Shift+J/K]", key_style),
+        Span::styled(" Move  |  ", dim_style),
+        Span::styled("[space]", key_style),
+        Span::styled(" Toggle  |  ", dim_style),
+        Span::styled("[←/→]", key_style),
+        Span::styled(" Seek  |  ", dim_style),
+        Span::styled("[Shift+←/→]", key_style),
+        Span::styled(" Skip  |  ", dim_style),
+        Span::styled("[q]", key_style),
+        Span::styled(" Quit", dim_style),
+    ]);
+
+    let bar = Paragraph::new(controls_text).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(app.theme.border))
