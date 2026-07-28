@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -5,7 +6,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context;
 use crossterm::{
@@ -99,7 +100,7 @@ struct Theme {
 }
 
 impl Theme {
-    fn load_or_default() -> Self {
+    fn load_or_default() -> (Self, Option<String>) {
         let config_path = env::var("HOME")
             .ok()
             .map(|home| PathBuf::from(home).join(".config/tuiplay/theme.json"));
@@ -107,28 +108,49 @@ impl Theme {
         let local_path = PathBuf::from("theme.json");
         let target_path = config_path.filter(|p| p.exists()).unwrap_or(local_path);
 
-        if let Ok(content) = fs::read_to_string(&target_path) {
-            if let Ok(v) = serde_json::from_str::<Value>(&content) {
-                let get_color = |key: &str, default: &str| -> Color {
-                    v.get(key)
-                        .and_then(|val| val.as_str())
-                        .map(parse_hex_color)
-                        .unwrap_or_else(|| parse_hex_color(default))
-                };
+        if target_path.exists() {
+            match fs::read_to_string(&target_path) {
+                Ok(content) => match serde_json::from_str::<Value>(&content) {
+                    Ok(v) => {
+                        let get_color = |key: &str, default: &str| -> Color {
+                            v.get(key)
+                                .and_then(|val| val.as_str())
+                                .map(parse_hex_color)
+                                .unwrap_or_else(|| parse_hex_color(default))
+                        };
 
-                return Self {
-                    border: get_color("border", "#008080"),
-                    title: get_color("title", "#70eceb"),
-                    dir: get_color("dir", "#20b2aa"),
-                    playing: get_color("playing", "#00f5d4"),
-                    text: get_color("text", "#cfedf0"),
-                    highlight_bg: get_color("highlight_bg", "#132e38"),
-                    highlight_fg: get_color("highlight_fg", "#80f3e6"),
-                    volume: get_color("volume", "#5bc0be"),
-                };
+                        let theme = Self {
+                            border: get_color("border", "#008080"),
+                            title: get_color("title", "#70eceb"),
+                            dir: get_color("dir", "#20b2aa"),
+                            playing: get_color("playing", "#00f5d4"),
+                            text: get_color("text", "#cfedf0"),
+                            highlight_bg: get_color("highlight_bg", "#132e38"),
+                            highlight_fg: get_color("highlight_fg", "#80f3e6"),
+                            volume: get_color("volume", "#5bc0be"),
+                        };
+                        return (theme, None);
+                    }
+                    Err(e) => {
+                        return (
+                            Self::default(),
+                            Some(format!("theme.json invalid: {e}; using defaults")),
+                        );
+                    }
+                },
+                Err(e) => {
+                    return (
+                        Self::default(),
+                        Some(format!("Could not read theme.json: {e}")),
+                    );
+                }
             }
         }
 
+        (Self::default(), None)
+    }
+
+    fn default() -> Self {
         Self {
             border: parse_hex_color("#008080"),
             title: parse_hex_color("#70eceb"),
@@ -157,11 +179,20 @@ fn extract_album_art(path: &Path) -> Option<image::DynamicImage> {
 // Mpv IPC Controller
 // ---------------------------------------------------------------------------
 
+struct MpvState {
+    time_pos: f64,
+    duration: f64,
+    volume: f64,
+    paused: bool,
+    idle: bool,
+}
+
 struct Mpv {
     child: Child,
     writer: UnixStream,
     reader: BufReader<UnixStream>,
     socket_path: PathBuf,
+    state: MpvState,
 }
 
 impl Mpv {
@@ -203,7 +234,7 @@ impl Mpv {
         let mut connected = None;
         for _ in 0..50 {
             if let Ok(s) = UnixStream::connect(&socket_path) {
-                let _ = s.set_read_timeout(Some(Duration::from_millis(100)));
+                let _ = s.set_nonblocking(true);
                 connected = Some(s);
                 break;
             }
@@ -212,112 +243,131 @@ impl Mpv {
         let writer = connected.context("mpv did not open its IPC socket in time")?;
         let reader = BufReader::new(writer.try_clone()?);
 
-        Ok(Self {
+        let mut mpv = Self {
             child,
             writer,
             reader,
             socket_path,
-        })
+            state: MpvState {
+                time_pos: 0.0,
+                duration: 0.0,
+                volume: 100.0,
+                paused: false,
+                idle: true,
+            },
+        };
+
+        mpv.observe_properties();
+        Ok(mpv)
     }
 
-    fn send(&mut self, payload: Value) -> anyhow::Result<Value> {
+    fn observe_properties(&mut self) {
+        let cmds = [
+            json!({ "command": ["observe_property", 1, "time-pos"] }),
+            json!({ "command": ["observe_property", 2, "duration"] }),
+            json!({ "command": ["observe_property", 3, "volume"] }),
+            json!({ "command": ["observe_property", 4, "pause"] }),
+            json!({ "command": ["observe_property", 5, "idle-active"] }),
+        ];
+        for cmd in cmds {
+            let _ = self.send_cmd(cmd);
+        }
+    }
+
+    fn send_cmd(&mut self, payload: Value) -> anyhow::Result<()> {
         let mut msg = payload.to_string();
         msg.push('\n');
         self.writer.write_all(msg.as_bytes())?;
         self.writer.flush()?;
+        Ok(())
+    }
 
-        let start = Instant::now();
+    fn poll_events(&mut self) {
         loop {
             let mut line = String::new();
             match self.reader.read_line(&mut line) {
-                Ok(0) => anyhow::bail!("mpv connection closed unexpectedly"),
+                Ok(0) => break,
                 Ok(_) => {
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
                         continue;
                     }
                     if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-                        if v.get("event").is_none() {
-                            return Ok(v);
+                        if v.get("event").and_then(|e| e.as_str()) == Some("property-change") {
+                            if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
+                                let data = v.get("data");
+                                match name {
+                                    "time-pos" => {
+                                        if let Some(val) = data.and_then(|d| d.as_f64()) {
+                                            self.state.time_pos = val;
+                                        }
+                                    }
+                                    "duration" => {
+                                        if let Some(val) = data.and_then(|d| d.as_f64()) {
+                                            self.state.duration = val;
+                                        }
+                                    }
+                                    "volume" => {
+                                        if let Some(val) = data.and_then(|d| d.as_f64()) {
+                                            self.state.volume = val;
+                                        }
+                                    }
+                                    "pause" => {
+                                        if let Some(val) = data.and_then(|d| d.as_bool()) {
+                                            self.state.paused = val;
+                                        }
+                                    }
+                                    "idle-active" => {
+                                        if let Some(val) = data.and_then(|d| d.as_bool()) {
+                                            self.state.idle = val;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
                     }
                 }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    if start.elapsed() > Duration::from_millis(500) {
-                        anyhow::bail!("mpv socket read timed out");
-                    }
-                }
-                Err(e) => return Err(e.into()),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
             }
         }
-    }
-
-    fn get_property(&mut self, name: &str) -> Value {
-        self.send(json!({ "command": ["get_property", name] }))
-            .ok()
-            .and_then(|v| v.get("data").cloned())
-            .unwrap_or(Value::Null)
     }
 
     fn play(&mut self, path: &Path) -> anyhow::Result<()> {
         let path_str = path.to_string_lossy().to_string();
-        let reply = self.send(json!({ "command": ["loadfile", path_str, "replace"] }))?;
-        if reply.get("error").and_then(|e| e.as_str()) != Some("success") {
-            anyhow::bail!(
-                "{}",
-                reply
-                    .get("error")
-                    .and_then(|e| e.as_str())
-                    .unwrap_or("unknown mpv error")
-            );
-        }
-
-        for _ in 0..20 {
-            std::thread::sleep(Duration::from_millis(50));
-            if !self.is_idle() {
-                break;
-            }
-        }
-
+        self.send_cmd(json!({ "command": ["loadfile", path_str, "replace"] }))?;
+        self.state.idle = false;
         Ok(())
     }
 
     fn toggle_pause(&mut self) {
-        let _ = self.send(json!({ "command": ["cycle", "pause"] }));
+        let _ = self.send_cmd(json!({ "command": ["cycle", "pause"] }));
     }
 
     fn stop(&mut self) {
-        let _ = self.send(json!({ "command": ["stop"] }));
+        let _ = self.send_cmd(json!({ "command": ["stop"] }));
+        self.state.idle = true;
     }
 
     fn set_volume(&mut self, vol: f64) {
         let vol = vol.clamp(0.0, 100.0);
-        let _ = self.send(json!({ "command": ["set_property", "volume", vol] }));
-    }
-
-    fn volume(&mut self) -> f64 {
-        self.get_property("volume").as_f64().unwrap_or(100.0)
+        self.state.volume = vol;
+        let _ = self.send_cmd(json!({ "command": ["set_property", "volume", vol] }));
     }
 
     fn seek(&mut self, seconds: f64) {
-        let _ = self.send(json!({ "command": ["seek", seconds, "relative"] }));
+        let _ = self.send_cmd(json!({ "command": ["seek", seconds, "relative"] }));
     }
 
-    fn is_idle(&mut self) -> bool {
-        self.get_property("idle-active").as_bool().unwrap_or(false)
-    }
-
-    fn is_paused(&mut self) -> bool {
-        self.get_property("pause").as_bool().unwrap_or(false)
+    fn is_dead(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
     }
 }
 
 impl Drop for Mpv {
     fn drop(&mut self) {
-        let _ = self.send(json!({ "command": ["quit"] }));
+        let _ = self.send_cmd(json!({ "command": ["quit"] }));
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.socket_path);
@@ -346,15 +396,20 @@ struct App {
 
     picker: Picker,
     current_artwork: Option<StatefulProtocol>,
+    art_cache: HashMap<PathBuf, Option<image::DynamicImage>>,
 
     controls: Option<MediaControls>,
     action_rx: Receiver<AppAction>,
+
+    search_query: String,
+    is_searching: bool,
+    pending_seek: f64,
 }
 
 impl App {
     fn new(start_dir: PathBuf) -> anyhow::Result<Self> {
         let mpv = Mpv::spawn()?;
-        let theme = Theme::load_or_default();
+        let (theme, theme_status) = Theme::load_or_default();
         let (tx, rx) = channel();
 
         let controls = Self::init_media_controls(tx);
@@ -370,16 +425,22 @@ impl App {
             mode: ViewMode::Files,
             mpv,
             current: None,
-            status: String::new(),
+            status: theme_status.unwrap_or_default(),
             should_quit: false,
             show_quit_popup: false,
             theme,
             picker,
             current_artwork: None,
+            art_cache: HashMap::new(),
             controls,
             action_rx: rx,
+            search_query: String::new(),
+            is_searching: false,
+            pending_seek: 0.0,
         };
+
         app.refresh_entries();
+        app.load_state();
         Ok(app)
     }
 
@@ -413,6 +474,96 @@ impl App {
             .ok()?;
 
         Some(controls)
+    }
+
+    fn save_state(&self) {
+        if let Ok(home) = env::var("HOME") {
+            let dir = PathBuf::from(home).join(".config/tuiplay");
+            if fs::create_dir_all(&dir).is_ok() {
+                let state_file = dir.join("state.json");
+                let data = json!({
+                    "current_dir": self.current_dir,
+                    "queue": self.queue,
+                    "volume": self.mpv.state.volume,
+                    "mode": match self.mode {
+                        ViewMode::Files => 1,
+                        ViewMode::Queue => 2,
+                        ViewMode::Zen => 3,
+                    }
+                });
+                let _ = fs::write(state_file, data.to_string());
+            }
+        }
+    }
+
+    fn load_state(&mut self) {
+        let state_file = env::var("HOME")
+            .ok()
+            .map(|home| PathBuf::from(home).join(".config/tuiplay/state.json"));
+
+        if let Some(file) = state_file.filter(|p| p.exists()) {
+            if let Ok(content) = fs::read_to_string(file) {
+                if let Ok(v) = serde_json::from_str::<Value>(&content) {
+                    if let Some(dir_str) = v.get("current_dir").and_then(|s| s.as_str()) {
+                        let dir = PathBuf::from(dir_str);
+                        if dir.is_dir() {
+                            self.current_dir = dir;
+                            self.refresh_entries();
+                        }
+                    }
+                    if let Some(q) = v.get("queue").and_then(|arr| arr.as_array()) {
+                        self.queue = q
+                            .iter()
+                            .filter_map(|val| val.as_str().map(PathBuf::from))
+                            .collect();
+                    }
+                    if let Some(vol) = v.get("volume").and_then(|val| val.as_f64()) {
+                        self.mpv.set_volume(vol);
+                    }
+                    if let Some(m) = v.get("mode").and_then(|val| val.as_u64()) {
+                        self.mode = match m {
+                            2 => ViewMode::Queue,
+                            3 => ViewMode::Zen,
+                            _ => ViewMode::Files,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_mpv_health(&mut self) {
+        if self.mpv.is_dead() {
+            self.status = "MPV died! Respawning process...".to_string();
+            if let Ok(mut new_mpv) = Mpv::spawn() {
+                let old_vol = self.mpv.state.volume;
+                new_mpv.set_volume(old_vol);
+                self.mpv = new_mpv;
+                if let Some(ref current) = self.current.clone() {
+                    let _ = self.mpv.play(current);
+                }
+                self.status = "MPV process respawned.".to_string();
+            }
+        }
+    }
+
+    fn process_pending_seek(&mut self) {
+        if self.pending_seek != 0.0 {
+            if self.current.is_some() {
+                self.mpv.seek(self.pending_seek);
+            }
+            self.pending_seek = 0.0;
+        }
+    }
+
+    fn update_search_selection(&mut self) {
+        if self.search_query.is_empty() {
+            return;
+        }
+        let q = self.search_query.to_lowercase();
+        if let Some(pos) = self.entries.iter().position(|e| e.name().to_lowercase().contains(&q)) {
+            self.selected_file = pos;
+        }
     }
 
     fn is_audio(path: &Path) -> bool {
@@ -535,10 +686,6 @@ impl App {
                     if entry.is_dir {
                         self.current_dir = entry.path;
                         self.refresh_entries();
-                    } else if self.current.is_some() {
-                        self.queue.push(entry.path.clone());
-                        self.status = format!("Added to queue: {}", entry.name());
-                        self.move_down();
                     } else {
                         self.play(&entry.path);
                     }
@@ -598,7 +745,13 @@ impl App {
                 self.status.clear();
                 self.update_media_metadata(path);
 
-                if let Some(img) = extract_album_art(path) {
+                let img_opt = self
+                    .art_cache
+                    .entry(path.to_path_buf())
+                    .or_insert_with(|| extract_album_art(path))
+                    .clone();
+
+                if let Some(img) = img_opt {
                     self.current_artwork = Some(self.picker.new_resize_protocol(img));
                 } else {
                     self.current_artwork = None;
@@ -641,7 +794,7 @@ impl App {
     }
 
     fn play_prev(&mut self) {
-        let pos = self.mpv.get_property("time-pos").as_f64().unwrap_or(0.0);
+        let pos = self.mpv.state.time_pos;
         if pos > 3.0 {
             self.mpv.seek(-pos);
             return;
@@ -667,8 +820,8 @@ impl App {
     fn toggle_pause(&mut self) {
         self.mpv.toggle_pause();
         if let Some(ref mut controls) = self.controls {
-            let is_paused = self.mpv.is_paused();
-            let pos_secs = self.mpv.get_property("time-pos").as_f64().unwrap_or(0.0);
+            let is_paused = self.mpv.state.paused;
+            let pos_secs = self.mpv.state.time_pos;
             let progress = Some(MediaPosition(Duration::from_secs_f64(pos_secs)));
 
             if is_paused {
@@ -689,24 +842,24 @@ impl App {
     }
 
     fn volume_up(&mut self) {
-        let v = self.mpv.volume();
+        let v = self.mpv.state.volume;
         self.mpv.set_volume(v + 10.0);
     }
 
     fn volume_down(&mut self) {
-        let v = self.mpv.volume();
+        let v = self.mpv.state.volume;
         self.mpv.set_volume(v - 10.0);
     }
 
     fn seek_forward(&mut self) {
         if self.current.is_some() {
-            self.mpv.seek(5.0);
+            self.pending_seek += 5.0;
         }
     }
 
     fn seek_backward(&mut self) {
         if self.current.is_some() {
-            self.mpv.seek(-5.0);
+            self.pending_seek -= 5.0;
         }
     }
 
@@ -854,15 +1007,18 @@ fn draw_file_list(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
+    let title = if app.is_searching {
+        format!(" Directory Files (Search: {}_) [Esc: Cancel] ", app.search_query)
+    } else {
+        " Directory Files (Press '/' to search | 'a' to queue) ".to_string()
+    };
+
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(app.theme.border))
-                .title(Span::styled(
-                    " Directory Files (Press 'a' to queue) ",
-                    Style::default().fg(app.theme.title),
-                )),
+                .title(Span::styled(title, Style::default().fg(app.theme.title))),
         )
         .highlight_style(
             Style::default()
@@ -879,7 +1035,6 @@ fn draw_file_list(f: &mut Frame, app: &App, area: Rect) {
 
     f.render_stateful_widget(list, area, &mut state);
 
-    // Vertical Scrollbar (as seen in todo-ratatui)
     if !app.entries.is_empty() {
         let scrollbar = Scrollbar::default()
             .orientation(ScrollbarOrientation::VerticalRight)
@@ -958,7 +1113,6 @@ fn draw_queue_list(f: &mut Frame, app: &App, area: Rect) {
 
     f.render_stateful_widget(list, area, &mut state);
 
-    // Vertical Scrollbar for Queue
     if !app.queue.is_empty() {
         let scrollbar = Scrollbar::default()
             .orientation(ScrollbarOrientation::VerticalRight)
@@ -1023,9 +1177,9 @@ fn draw_zen_mode(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(album_art_widget, inner_art_area);
     }
 
-    let pos = app.mpv.get_property("time-pos").as_f64().unwrap_or(0.0);
-    let duration = app.mpv.get_property("duration").as_f64().unwrap_or(0.0);
-    let vol_pct = app.mpv.volume().round() as i32;
+    let pos = app.mpv.state.time_pos;
+    let duration = app.mpv.state.duration;
+    let vol_pct = app.mpv.state.volume.round() as i32;
 
     let track_name = app
         .current
@@ -1044,7 +1198,7 @@ fn draw_zen_mode(f: &mut Frame, app: &mut App, area: Rect) {
 
     let play_state = if app.current.is_none() {
         "⏹ STOPPED"
-    } else if app.mpv.is_paused() {
+    } else if app.mpv.state.paused {
         "⏸ PAUSED"
     } else {
         "▶ PLAYING"
@@ -1117,8 +1271,8 @@ fn draw_player_status(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let pos = app.mpv.get_property("time-pos").as_f64().unwrap_or(0.0);
-    let duration = app.mpv.get_property("duration").as_f64().unwrap_or(0.0);
+    let pos = app.mpv.state.time_pos;
+    let duration = app.mpv.state.duration;
 
     let pos_str = format_time(pos);
     let dur_str = format_time(duration);
@@ -1136,7 +1290,7 @@ fn draw_player_status(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "Unknown".to_string());
 
-    let vol_pct = app.mpv.volume().round() as i32;
+    let vol_pct = app.mpv.state.volume.round() as i32;
 
     let line1 = Line::from(vec![
         Span::styled(
@@ -1165,7 +1319,7 @@ fn draw_player_status(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_controls_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let play_state = if app.current.is_none() {
         "STOPPED"
-    } else if app.mpv.is_paused() {
+    } else if app.mpv.state.paused {
         "PAUSED"
     } else {
         "PLAYING"
@@ -1184,10 +1338,10 @@ fn draw_controls_bar(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled(format!("[{play_state}]{status_msg}  "), Style::default().fg(app.theme.playing)),
         Span::styled("[1/2/3]", key_style),
         Span::styled(" Views  |  ", dim_style),
+        Span::styled("[/]", key_style),
+        Span::styled(" Search  |  ", dim_style),
         Span::styled("[j/k]", key_style),
         Span::styled(" Nav  |  ", dim_style),
-        Span::styled("[Shift+J/K]", key_style),
-        Span::styled(" Move  |  ", dim_style),
         Span::styled("[space]", key_style),
         Span::styled(" Toggle  |  ", dim_style),
         Span::styled("[←/→]", key_style),
@@ -1274,9 +1428,13 @@ fn run<B: ratatui::backend::Backend>(
     app: &mut App,
 ) -> anyhow::Result<()> {
     loop {
+        app.mpv.poll_events();
+        app.check_mpv_health();
+        app.process_pending_seek();
+
         terminal.draw(|f| draw(f, app))?;
 
-        if event::poll(Duration::from_millis(150))? {
+        if event::poll(Duration::from_millis(30))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     handle_key(app, key);
@@ -1286,11 +1444,12 @@ fn run<B: ratatui::backend::Backend>(
 
         app.process_external_actions();
 
-        if app.current.is_some() && app.mpv.is_idle() {
+        if app.current.is_some() && app.mpv.state.idle {
             app.play_next();
         }
 
         if app.should_quit {
+            app.save_state();
             break;
         }
     }
@@ -1305,6 +1464,28 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
                 app.show_quit_popup = false;
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    if app.is_searching {
+        match key.code {
+            KeyCode::Esc => {
+                app.is_searching = false;
+                app.search_query.clear();
+            }
+            KeyCode::Enter => {
+                app.is_searching = false;
+            }
+            KeyCode::Backspace => {
+                app.search_query.pop();
+                app.update_search_selection();
+            }
+            KeyCode::Char(c) => {
+                app.search_query.push(c);
+                app.update_search_selection();
             }
             _ => {}
         }
@@ -1329,6 +1510,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('1') => app.mode = ViewMode::Files,
         KeyCode::Char('2') => app.mode = ViewMode::Queue,
         KeyCode::Char('3') => app.mode = ViewMode::Zen,
+
+        KeyCode::Char('/') if app.mode == ViewMode::Files => {
+            app.is_searching = true;
+            app.search_query.clear();
+        }
 
         KeyCode::Char('J') => app.queue_move_down(),
         KeyCode::Char('K') => app.queue_move_up(),
