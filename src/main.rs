@@ -6,6 +6,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -29,11 +30,32 @@ use ratatui::{
 };
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol, StatefulImage};
 use serde_json::{json, Value};
-use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPosition, PlatformConfig};
+use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig};
 
 const AUDIO_EXTS: &[&str] = &[
     "mp3", "flac", "ogg", "wav", "m4a", "aac", "opus", "wma", "aiff", "alac",
 ];
+
+fn get_config_dir() -> PathBuf {
+    if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
+        PathBuf::from(config_home).join("tuiplay")
+    } else if let Ok(home) = env::var("HOME") {
+        PathBuf::from(home).join(".config/tuiplay")
+    } else {
+        PathBuf::from(".tuiplay")
+    }
+}
+
+fn pseudo_random_index(len: usize) -> usize {
+    if len <= 1 {
+        return 0;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    (nanos as usize) % len
+}
 
 #[derive(Debug)]
 enum AppAction {
@@ -43,15 +65,36 @@ enum AppAction {
     Stop,
 }
 
-// ---------------------------------------------------------------------------
-// Views & Entry
-// ---------------------------------------------------------------------------
-
 #[derive(PartialEq, Clone, Copy)]
 enum ViewMode {
     Files,
     Queue,
     Zen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LoopMode {
+    Off,
+    Track,
+    Queue,
+}
+
+impl LoopMode {
+    fn next(self) -> Self {
+        match self {
+            LoopMode::Off => LoopMode::Track,
+            LoopMode::Track => LoopMode::Queue,
+            LoopMode::Queue => LoopMode::Off,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            LoopMode::Off => "Off",
+            LoopMode::Track => "Track",
+            LoopMode::Queue => "Queue",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -74,12 +117,18 @@ impl Entry {
 // ---------------------------------------------------------------------------
 
 fn parse_hex_color(hex: &str) -> Color {
-    let hex = hex.trim_start_matches('#');
-    if hex.len() == 6 {
+    let hex = hex.trim().trim_start_matches('#');
+    let full_hex = if hex.len() == 3 {
+        hex.chars().map(|c| format!("{c}{c}")).collect::<String>()
+    } else {
+        hex.to_string()
+    };
+
+    if full_hex.len() == 6 {
         if let (Ok(r), Ok(g), Ok(b)) = (
-            u8::from_str_radix(&hex[0..2], 16),
-            u8::from_str_radix(&hex[2..4], 16),
-            u8::from_str_radix(&hex[4..6], 16),
+            u8::from_str_radix(&full_hex[0..2], 16),
+            u8::from_str_radix(&full_hex[2..4], 16),
+            u8::from_str_radix(&full_hex[4..6], 16),
         ) {
             return Color::Rgb(r, g, b);
         }
@@ -97,19 +146,36 @@ struct Theme {
     highlight_bg: Color,
     highlight_fg: Color,
     volume: Color,
+    yes: Color,
+    no: Color,
+    selector: Color,
+    paused: Color,
+    search: Color,
 }
 
 impl Theme {
+    fn status_color(&self, has_track: bool, paused: bool) -> Color {
+        if !has_track {
+            self.no
+        } else if paused {
+            self.paused
+        } else {
+            self.playing
+        }
+    }
+
     fn load_or_default() -> (Self, Option<String>) {
-        let config_path = env::var("HOME")
-            .ok()
-            .map(|home| PathBuf::from(home).join(".config/tuiplay/theme.json"));
-
         let local_path = PathBuf::from("theme.json");
-        let target_path = config_path.filter(|p| p.exists()).unwrap_or(local_path);
+        let config_path = get_config_dir().join("theme.json");
 
-        if target_path.exists() {
-            match fs::read_to_string(&target_path) {
+        let target_path = if local_path.exists() {
+            Some(local_path)
+        } else {
+            Some(config_path).filter(|p| p.exists())
+        };
+
+        if let Some(path) = target_path {
+            match fs::read_to_string(&path) {
                 Ok(content) => match serde_json::from_str::<Value>(&content) {
                     Ok(v) => {
                         let get_color = |key: &str, default: &str| -> Color {
@@ -120,14 +186,19 @@ impl Theme {
                         };
 
                         let theme = Self {
-                            border: get_color("border", "#008080"),
-                            title: get_color("title", "#70eceb"),
-                            dir: get_color("dir", "#20b2aa"),
-                            playing: get_color("playing", "#00f5d4"),
-                            text: get_color("text", "#cfedf0"),
-                            highlight_bg: get_color("highlight_bg", "#132e38"),
-                            highlight_fg: get_color("highlight_fg", "#80f3e6"),
-                            volume: get_color("volume", "#5bc0be"),
+                            border: get_color("border", "#cba6f7"),
+                            title: get_color("title", "#f5c2e7"),
+                            dir: get_color("dir", "#89b4fa"),
+                            playing: get_color("playing", "#a6e3a1"),
+                            text: get_color("text", "#cdd6f4"),
+                            highlight_bg: get_color("highlight_bg", "#313244"),
+                            highlight_fg: get_color("highlight_fg", "#cba6f7"),
+                            volume: get_color("volume", "#fab387"),
+                            yes: get_color("yes", "#a6e3a1"),
+                            no: get_color("no", "#f38ba8"),
+                            selector: get_color("selector", "#f9e2af"),
+                            paused: get_color("paused", "#f9e2af"),
+                            search: get_color("search", "#74c7ec"),
                         };
                         return (theme, None);
                     }
@@ -141,7 +212,7 @@ impl Theme {
                 Err(e) => {
                     return (
                         Self::default(),
-                        Some(format!("Could not read theme.json: {e}")),
+                        Some(format!("Could not read theme file: {e}")),
                     );
                 }
             }
@@ -152,14 +223,19 @@ impl Theme {
 
     fn default() -> Self {
         Self {
-            border: parse_hex_color("#008080"),
-            title: parse_hex_color("#70eceb"),
-            dir: parse_hex_color("#20b2aa"),
-            playing: parse_hex_color("#00f5d4"),
-            text: parse_hex_color("#cfedf0"),
-            highlight_bg: parse_hex_color("#132e38"),
-            highlight_fg: parse_hex_color("#80f3e6"),
-            volume: parse_hex_color("#5bc0be"),
+            border: parse_hex_color("#cba6f7"),
+            title: parse_hex_color("#f5c2e7"),
+            dir: parse_hex_color("#89b4fa"),
+            playing: parse_hex_color("#a6e3a1"),
+            text: parse_hex_color("#cdd6f4"),
+            highlight_bg: parse_hex_color("#313244"),
+            highlight_fg: parse_hex_color("#cba6f7"),
+            volume: parse_hex_color("#fab387"),
+            yes: parse_hex_color("#a6e3a1"),
+            no: parse_hex_color("#f38ba8"),
+            selector: parse_hex_color("#f9e2af"),
+            paused: parse_hex_color("#f9e2af"),
+            search: parse_hex_color("#74c7ec"),
         }
     }
 }
@@ -176,8 +252,12 @@ fn extract_album_art(path: &Path) -> Option<image::DynamicImage> {
 }
 
 // ---------------------------------------------------------------------------
-// Mpv IPC Controller
+// Decoupled Threaded Mpv IPC Controller
 // ---------------------------------------------------------------------------
+
+enum MpvEvent {
+    PropertyChange { name: String, data: Value },
+}
 
 struct MpvState {
     time_pos: f64,
@@ -190,7 +270,7 @@ struct MpvState {
 struct Mpv {
     child: Child,
     writer: UnixStream,
-    reader: BufReader<UnixStream>,
+    event_rx: Receiver<MpvEvent>,
     socket_path: PathBuf,
     state: MpvState,
 }
@@ -215,9 +295,7 @@ impl Mpv {
             PathBuf::from("/usr/lib/mpv/mpris.so"),
             PathBuf::from("/usr/lib64/mpv/mpris.so"),
             PathBuf::from("/usr/local/lib/mpv/mpris.so"),
-            env::var("HOME")
-                .map(|h| PathBuf::from(h).join(".config/mpv/scripts/mpris.so"))
-                .unwrap_or_default(),
+            get_config_dir().join("scripts/mpris.so"),
         ];
 
         if let Some(mpris_plugin) = candidate_mpris_paths.iter().find(|p| p.exists()) {
@@ -234,19 +312,40 @@ impl Mpv {
         let mut connected = None;
         for _ in 0..50 {
             if let Ok(s) = UnixStream::connect(&socket_path) {
-                let _ = s.set_nonblocking(true);
                 connected = Some(s);
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
         let writer = connected.context("mpv did not open its IPC socket in time")?;
-        let reader = BufReader::new(writer.try_clone()?);
+        let reader_stream = writer.try_clone()?;
+
+        let (event_tx, event_rx) = channel();
+
+        thread::spawn(move || {
+            let mut reader = BufReader::new(reader_stream);
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+                        if v.get("event").and_then(|e| e.as_str()) == Some("property-change") {
+                            if let Some(name) = v.get("name").and_then(|n| n.as_str()).map(String::from) {
+                                if let Some(data) = v.get("data").cloned() {
+                                    let _ = event_tx.send(MpvEvent::PropertyChange { name, data });
+                                }
+                            }
+                        }
+                    }
+                }
+                line.clear();
+            }
+        });
 
         let mut mpv = Self {
             child,
             writer,
-            reader,
+            event_rx,
             socket_path,
             state: MpvState {
                 time_pos: 0.0,
@@ -283,53 +382,36 @@ impl Mpv {
     }
 
     fn poll_events(&mut self) {
-        loop {
-            let mut line = String::new();
-            match self.reader.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-                        if v.get("event").and_then(|e| e.as_str()) == Some("property-change") {
-                            if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
-                                let data = v.get("data");
-                                match name {
-                                    "time-pos" => {
-                                        if let Some(val) = data.and_then(|d| d.as_f64()) {
-                                            self.state.time_pos = val;
-                                        }
-                                    }
-                                    "duration" => {
-                                        if let Some(val) = data.and_then(|d| d.as_f64()) {
-                                            self.state.duration = val;
-                                        }
-                                    }
-                                    "volume" => {
-                                        if let Some(val) = data.and_then(|d| d.as_f64()) {
-                                            self.state.volume = val;
-                                        }
-                                    }
-                                    "pause" => {
-                                        if let Some(val) = data.and_then(|d| d.as_bool()) {
-                                            self.state.paused = val;
-                                        }
-                                    }
-                                    "idle-active" => {
-                                        if let Some(val) = data.and_then(|d| d.as_bool()) {
-                                            self.state.idle = val;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
+        while let Ok(evt) = self.event_rx.try_recv() {
+            match evt {
+                MpvEvent::PropertyChange { name, data } => match name.as_str() {
+                    "time-pos" => {
+                        if let Some(val) = data.as_f64() {
+                            self.state.time_pos = val;
                         }
                     }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
+                    "duration" => {
+                        if let Some(val) = data.as_f64() {
+                            self.state.duration = val;
+                        }
+                    }
+                    "volume" => {
+                        if let Some(val) = data.as_f64() {
+                            self.state.volume = val;
+                        }
+                    }
+                    "pause" => {
+                        if let Some(val) = data.as_bool() {
+                            self.state.paused = val;
+                        }
+                    }
+                    "idle-active" => {
+                        if let Some(val) = data.as_bool() {
+                            self.state.idle = val;
+                        }
+                    }
+                    _ => {}
+                },
             }
         }
     }
@@ -381,17 +463,23 @@ impl Drop for Mpv {
 struct App {
     current_dir: PathBuf,
     entries: Vec<Entry>,
+    filtered_indices: Vec<usize>,
     selected_file: usize,
 
     queue: Vec<PathBuf>,
     selected_queue: usize,
 
     mode: ViewMode,
+    loop_mode: LoopMode,
+    is_shuffled: bool,
+
     mpv: Mpv,
     current: Option<PathBuf>,
     status: String,
     should_quit: bool,
     show_quit_popup: bool,
+    show_help_popup: bool,
+
     theme: Theme,
 
     picker: Picker,
@@ -419,15 +507,19 @@ impl App {
         let mut app = Self {
             current_dir: start_dir,
             entries: Vec::new(),
+            filtered_indices: Vec::new(),
             selected_file: 0,
             queue: Vec::new(),
             selected_queue: 0,
             mode: ViewMode::Files,
+            loop_mode: LoopMode::Off,
+            is_shuffled: false,
             mpv,
             current: None,
             status: theme_status.unwrap_or_default(),
             should_quit: false,
             show_quit_popup: false,
+            show_help_popup: false,
             theme,
             picker,
             current_artwork: None,
@@ -442,6 +534,12 @@ impl App {
         app.refresh_entries();
         app.load_state();
         Ok(app)
+    }
+
+    fn reload_theme(&mut self) {
+        let (theme, status) = Theme::load_or_default();
+        self.theme = theme;
+        self.status = status.unwrap_or_else(|| "Theme reloaded successfully".to_string());
     }
 
     fn init_media_controls(tx: Sender<AppAction>) -> Option<MediaControls> {
@@ -477,32 +575,34 @@ impl App {
     }
 
     fn save_state(&self) {
-        if let Ok(home) = env::var("HOME") {
-            let dir = PathBuf::from(home).join(".config/tuiplay");
-            if fs::create_dir_all(&dir).is_ok() {
-                let state_file = dir.join("state.json");
-                let data = json!({
-                    "current_dir": self.current_dir,
-                    "queue": self.queue,
-                    "volume": self.mpv.state.volume,
-                    "mode": match self.mode {
-                        ViewMode::Files => 1,
-                        ViewMode::Queue => 2,
-                        ViewMode::Zen => 3,
-                    }
-                });
-                let _ = fs::write(state_file, data.to_string());
-            }
+        let dir = get_config_dir();
+        if fs::create_dir_all(&dir).is_ok() {
+            let state_file = dir.join("state.json");
+            let data = json!({
+                "current_dir": self.current_dir,
+                "queue": self.queue,
+                "volume": self.mpv.state.volume,
+                "mode": match self.mode {
+                    ViewMode::Files => 1,
+                    ViewMode::Queue => 2,
+                    ViewMode::Zen => 3,
+                },
+                "loop_mode": match self.loop_mode {
+                    LoopMode::Off => 0,
+                    LoopMode::Track => 1,
+                    LoopMode::Queue => 2,
+                },
+                "is_shuffled": self.is_shuffled,
+            });
+            let _ = fs::write(state_file, data.to_string());
         }
     }
 
     fn load_state(&mut self) {
-        let state_file = env::var("HOME")
-            .ok()
-            .map(|home| PathBuf::from(home).join(".config/tuiplay/state.json"));
+        let state_file = get_config_dir().join("state.json");
 
-        if let Some(file) = state_file.filter(|p| p.exists()) {
-            if let Ok(content) = fs::read_to_string(file) {
+        if state_file.exists() {
+            if let Ok(content) = fs::read_to_string(state_file) {
                 if let Ok(v) = serde_json::from_str::<Value>(&content) {
                     if let Some(dir_str) = v.get("current_dir").and_then(|s| s.as_str()) {
                         let dir = PathBuf::from(dir_str);
@@ -527,9 +627,20 @@ impl App {
                             _ => ViewMode::Files,
                         };
                     }
+                    if let Some(l) = v.get("loop_mode").and_then(|val| val.as_u64()) {
+                        self.loop_mode = match l {
+                            1 => LoopMode::Track,
+                            2 => LoopMode::Queue,
+                            _ => LoopMode::Off,
+                        };
+                    }
+                    if let Some(s) = v.get("is_shuffled").and_then(|val| val.as_bool()) {
+                        self.is_shuffled = s;
+                    }
                 }
             }
         }
+        self.clamp_selection();
     }
 
     fn check_mpv_health(&mut self) {
@@ -556,13 +667,49 @@ impl App {
         }
     }
 
-    fn update_search_selection(&mut self) {
-        if self.search_query.is_empty() {
-            return;
+    fn sync_mpris(&mut self) {
+        if let Some(ref mut controls) = self.controls {
+            let is_paused = self.mpv.state.paused;
+            let pos_secs = self.mpv.state.time_pos;
+            let progress = Some(MediaPosition(Duration::from_secs_f64(pos_secs)));
+
+            if self.current.is_none() || self.mpv.state.idle {
+                let _ = controls.set_playback(MediaPlayback::Stopped);
+            } else if is_paused {
+                let _ = controls.set_playback(MediaPlayback::Paused { progress });
+            } else {
+                let _ = controls.set_playback(MediaPlayback::Playing { progress });
+            }
         }
-        let q = self.search_query.to_lowercase();
-        if let Some(pos) = self.entries.iter().position(|e| e.name().to_lowercase().contains(&q)) {
-            self.selected_file = pos;
+    }
+
+    fn update_search_filter(&mut self) {
+        if self.search_query.is_empty() {
+            self.filtered_indices = (0..self.entries.len()).collect();
+        } else {
+            let q = self.search_query.to_lowercase();
+            self.filtered_indices = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.name().to_lowercase().contains(&q))
+                .map(|(idx, _)| idx)
+                .collect();
+        }
+        self.clamp_selection();
+    }
+
+    fn clamp_selection(&mut self) {
+        if self.filtered_indices.is_empty() {
+            self.selected_file = 0;
+        } else if self.selected_file >= self.filtered_indices.len() {
+            self.selected_file = self.filtered_indices.len() - 1;
+        }
+
+        if self.queue.is_empty() {
+            self.selected_queue = 0;
+        } else if self.selected_queue >= self.queue.len() {
+            self.selected_queue = self.queue.len() - 1;
         }
     }
 
@@ -603,7 +750,7 @@ impl App {
 
         self.entries = dirs;
         self.entries.extend(files);
-        self.selected_file = 0;
+        self.update_search_filter();
     }
 
     fn move_up(&mut self) {
@@ -625,7 +772,9 @@ impl App {
     fn move_down(&mut self) {
         match self.mode {
             ViewMode::Files => {
-                if !self.entries.is_empty() && self.selected_file + 1 < self.entries.len() {
+                if !self.filtered_indices.is_empty()
+                    && self.selected_file + 1 < self.filtered_indices.len()
+                {
                     self.selected_file += 1;
                 }
             }
@@ -657,11 +806,13 @@ impl App {
 
     fn add_selected_to_queue(&mut self) {
         if self.mode == ViewMode::Files {
-            if let Some(entry) = self.entries.get(self.selected_file) {
-                if !entry.is_dir {
-                    self.queue.push(entry.path.clone());
-                    self.status = format!("Added to queue: {}", entry.name());
-                    self.move_down();
+            if let Some(&entry_idx) = self.filtered_indices.get(self.selected_file) {
+                if let Some(entry) = self.entries.get(entry_idx) {
+                    if !entry.is_dir {
+                        self.queue.push(entry.path.clone());
+                        self.status = format!("Added to queue: {}", entry.name());
+                        self.move_down();
+                    }
                 }
             }
         }
@@ -670,9 +821,7 @@ impl App {
     fn remove_from_queue(&mut self) {
         if self.mode == ViewMode::Queue && !self.queue.is_empty() {
             let removed = self.queue.remove(self.selected_queue);
-            if self.selected_queue >= self.queue.len() && !self.queue.is_empty() {
-                self.selected_queue = self.queue.len() - 1;
-            }
+            self.clamp_selection();
             if let Some(name) = removed.file_name() {
                 self.status = format!("Removed from queue: {}", name.to_string_lossy());
             }
@@ -682,12 +831,16 @@ impl App {
     fn enter_selected(&mut self) {
         match self.mode {
             ViewMode::Files => {
-                if let Some(entry) = self.entries.get(self.selected_file).cloned() {
-                    if entry.is_dir {
-                        self.current_dir = entry.path;
-                        self.refresh_entries();
-                    } else {
-                        self.play(&entry.path);
+                if let Some(&entry_idx) = self.filtered_indices.get(self.selected_file) {
+                    if let Some(entry) = self.entries.get(entry_idx).cloned() {
+                        if entry.is_dir {
+                            self.current_dir = entry.path;
+                            self.search_query.clear();
+                            self.is_searching = false;
+                            self.refresh_entries();
+                        } else {
+                            self.play(&entry.path);
+                        }
                     }
                 }
             }
@@ -705,9 +858,11 @@ impl App {
             if let Some(parent) = self.current_dir.parent().map(|p| p.to_path_buf()) {
                 let old_dir = self.current_dir.clone();
                 self.current_dir = parent;
+                self.search_query.clear();
+                self.is_searching = false;
                 self.refresh_entries();
 
-                if let Some(pos) = self.entries.iter().position(|e| e.path == old_dir) {
+                if let Some(pos) = self.filtered_indices.iter().position(|&idx| self.entries[idx].path == old_dir) {
                     self.selected_file = pos;
                 }
             }
@@ -732,7 +887,7 @@ impl App {
                 ..Default::default()
             });
 
-            let _ = controls.set_playback(souvlaki::MediaPlayback::Playing {
+            let _ = controls.set_playback(MediaPlayback::Playing {
                 progress: Some(MediaPosition(Duration::from_secs(0))),
             });
         }
@@ -764,33 +919,67 @@ impl App {
     }
 
     fn play_next(&mut self) {
-        if !self.queue.is_empty() {
-            let next_track = self.queue.remove(0);
-            if self.selected_queue >= self.queue.len() && !self.queue.is_empty() {
-                self.selected_queue = self.queue.len() - 1;
+        if self.loop_mode == LoopMode::Track {
+            if let Some(current) = self.current.clone() {
+                self.play(&current);
+                return;
             }
+        }
+
+        if !self.queue.is_empty() {
+            let next_idx = if self.is_shuffled {
+                pseudo_random_index(self.queue.len())
+            } else {
+                0
+            };
+
+            let next_track = self.queue.remove(next_idx);
+            if self.loop_mode == LoopMode::Queue {
+                self.queue.push(next_track.clone());
+            }
+
+            self.clamp_selection();
             self.play(&next_track);
             return;
         }
 
         if let Some(current) = self.current.clone() {
             if let Some(pos) = self.entries.iter().position(|e| e.path == current) {
-                if let Some(next) = self.entries[pos + 1..].iter().find(|e| !e.is_dir) {
+                if self.is_shuffled {
+                    let audio_files: Vec<_> = self.entries.iter().filter(|e| !e.is_dir).collect();
+                    if !audio_files.is_empty() {
+                        let pick = audio_files[pseudo_random_index(audio_files.len())];
+                        let path = pick.path.clone();
+                        if let Some(new_pos) = self.filtered_indices.iter().position(|&idx| self.entries[idx].path == path) {
+                            self.selected_file = new_pos;
+                        }
+                        self.play(&path);
+                        return;
+                    }
+                } else if let Some(next) = self.entries[pos + 1..].iter().find(|e| !e.is_dir) {
                     let path = next.path.clone();
-                    if let Some(new_pos) = self.entries.iter().position(|e| e.path == path) {
+                    if let Some(new_pos) = self.filtered_indices.iter().position(|&idx| self.entries[idx].path == path) {
                         self.selected_file = new_pos;
                     }
                     self.play(&path);
                     return;
+                } else if self.loop_mode == LoopMode::Queue {
+                    if let Some(first) = self.entries.iter().find(|e| !e.is_dir) {
+                        let path = first.path.clone();
+                        if let Some(new_pos) = self.filtered_indices.iter().position(|&idx| self.entries[idx].path == path) {
+                            self.selected_file = new_pos;
+                        }
+                        self.play(&path);
+                        return;
+                    }
                 }
             }
         }
+
         self.current = None;
         self.current_artwork = None;
         self.status = "Playback finished".to_string();
-        if let Some(ref mut controls) = self.controls {
-            let _ = controls.set_playback(souvlaki::MediaPlayback::Stopped);
-        }
+        self.sync_mpris();
     }
 
     fn play_prev(&mut self) {
@@ -805,7 +994,7 @@ impl App {
                 if pos > 0 {
                     if let Some(prev) = self.entries[..pos].iter().rev().find(|e| !e.is_dir) {
                         let path = prev.path.clone();
-                        if let Some(new_pos) = self.entries.iter().position(|e| e.path == path) {
+                        if let Some(new_pos) = self.filtered_indices.iter().position(|&idx| self.entries[idx].path == path) {
                             self.selected_file = new_pos;
                         }
                         self.play(&path);
@@ -819,26 +1008,14 @@ impl App {
 
     fn toggle_pause(&mut self) {
         self.mpv.toggle_pause();
-        if let Some(ref mut controls) = self.controls {
-            let is_paused = self.mpv.state.paused;
-            let pos_secs = self.mpv.state.time_pos;
-            let progress = Some(MediaPosition(Duration::from_secs_f64(pos_secs)));
-
-            if is_paused {
-                let _ = controls.set_playback(souvlaki::MediaPlayback::Paused { progress });
-            } else {
-                let _ = controls.set_playback(souvlaki::MediaPlayback::Playing { progress });
-            }
-        }
+        self.sync_mpris();
     }
 
     fn stop(&mut self) {
         self.mpv.stop();
         self.current = None;
         self.current_artwork = None;
-        if let Some(ref mut controls) = self.controls {
-            let _ = controls.set_playback(souvlaki::MediaPlayback::Stopped);
-        }
+        self.sync_mpris();
     }
 
     fn volume_up(&mut self) {
@@ -949,6 +1126,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.show_quit_popup {
         draw_quit_popup(f, app);
     }
+
+    if app.show_help_popup {
+        draw_help_popup(f, app);
+    }
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -981,9 +1162,10 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_file_list(f: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
-        .entries
+        .filtered_indices
         .iter()
-        .map(|e| {
+        .map(|&idx| {
+            let e = &app.entries[idx];
             let is_current = app.current.as_ref() == Some(&e.path);
             let label = if e.is_dir {
                 format!("  📁 {}/", e.name())
@@ -1008,17 +1190,24 @@ fn draw_file_list(f: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     let title = if app.is_searching {
-        format!(" Directory Files (Search: {}_) [Esc: Cancel] ", app.search_query)
+        format!(" Directory Files (Filtering: {}) [Esc: Clear] ", app.search_query)
     } else {
-        " Directory Files (Press '/' to search | 'a' to queue) ".to_string()
+        format!(
+            " Directory Files ({}/{}) (Press '/' to search | 'a' to queue) ",
+            app.filtered_indices.len(),
+            app.entries.len()
+        )
     };
+
+    let border_color = if app.is_searching { app.theme.search } else { app.theme.border };
+    let title_color = if app.is_searching { app.theme.search } else { app.theme.title };
 
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(app.theme.border))
-                .title(Span::styled(title, Style::default().fg(app.theme.title))),
+                .border_style(Style::default().fg(border_color))
+                .title(Span::styled(title, Style::default().fg(title_color))),
         )
         .highlight_style(
             Style::default()
@@ -1029,13 +1218,13 @@ fn draw_file_list(f: &mut Frame, app: &App, area: Rect) {
         .highlight_symbol("> ");
 
     let mut state = ListState::default();
-    if !app.entries.is_empty() {
+    if !app.filtered_indices.is_empty() {
         state.select(Some(app.selected_file));
     }
 
     f.render_stateful_widget(list, area, &mut state);
 
-    if !app.entries.is_empty() {
+    if !app.filtered_indices.is_empty() {
         let scrollbar = Scrollbar::default()
             .orientation(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("↑"))
@@ -1044,8 +1233,8 @@ fn draw_file_list(f: &mut Frame, app: &App, area: Rect) {
             .thumb_symbol("█")
             .style(Style::default().fg(app.theme.border));
 
-        let mut scrollbar_state =
-            ScrollbarState::new(app.entries.len().saturating_sub(1)).position(app.selected_file);
+        let mut scrollbar_state = ScrollbarState::new(app.filtered_indices.len().saturating_sub(1))
+            .position(app.selected_file);
 
         f.render_stateful_widget(
             scrollbar,
@@ -1101,7 +1290,7 @@ fn draw_queue_list(f: &mut Frame, app: &App, area: Rect) {
         .highlight_style(
             Style::default()
                 .bg(app.theme.highlight_bg)
-                .fg(app.theme.highlight_fg)
+                .fg(app.theme.selector)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("> ");
@@ -1177,6 +1366,11 @@ fn draw_zen_mode(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(album_art_widget, inner_art_area);
     }
 
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(100)])
+        .split(zen_layout[1]);
+
     let pos = app.mpv.state.time_pos;
     let duration = app.mpv.state.duration;
     let vol_pct = app.mpv.state.volume.round() as i32;
@@ -1208,7 +1402,7 @@ fn draw_zen_mode(f: &mut Frame, app: &mut App, area: Rect) {
     let dur_str = format_time(duration);
     let pct = if duration > 0.0 { (pos / duration) * 100.0 } else { 0.0 };
 
-    let bar_width = (zen_layout[1].width as usize).saturating_sub(18).max(10);
+    let bar_width = (right_chunks[0].width as usize).saturating_sub(18).max(10);
     let progress_bar = make_progress_bar(pct, bar_width);
 
     let meta_lines = vec![
@@ -1231,7 +1425,7 @@ fn draw_zen_mode(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(
                 play_state,
                 Style::default()
-                    .fg(app.theme.dir)
+                    .fg(app.theme.status_color(app.current.is_some(), app.mpv.state.paused))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!("   [Vol: {vol_pct}%]"), Style::default().fg(app.theme.volume)),
@@ -1256,7 +1450,7 @@ fn draw_zen_mode(f: &mut Frame, app: &mut App, area: Rect) {
                 .title(Span::styled(" Now Playing (Zen Mode) ", Style::default().fg(app.theme.title))),
         );
 
-    f.render_widget(metadata_widget, zen_layout[1]);
+    f.render_widget(metadata_widget, right_chunks[0]);
 }
 
 fn draw_player_status(f: &mut Frame, app: &mut App, area: Rect) {
@@ -1296,7 +1490,7 @@ fn draw_player_status(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled(
             format!(" ♪ {track_name}"),
             Style::default()
-                .fg(app.theme.playing)
+                .fg(app.theme.status_color(app.current.is_some(), app.mpv.state.paused))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("   [Vol: {vol_pct}%]"), Style::default().fg(app.theme.volume)),
@@ -1335,19 +1529,18 @@ fn draw_controls_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let key_style = Style::default().fg(app.theme.title).add_modifier(Modifier::BOLD);
 
     let controls_text = Line::from(vec![
-        Span::styled(format!("[{play_state}]{status_msg}  "), Style::default().fg(app.theme.playing)),
+        Span::styled(
+            format!("[{play_state}]{status_msg}  "),
+            Style::default().fg(app.theme.status_color(app.current.is_some(), app.mpv.state.paused)),
+        ),
         Span::styled("[1/2/3]", key_style),
         Span::styled(" Views  |  ", dim_style),
+        Span::styled("[?]", key_style),
+        Span::styled(" Keybinds  |  ", dim_style),
         Span::styled("[/]", key_style),
-        Span::styled(" Search  |  ", dim_style),
-        Span::styled("[j/k]", key_style),
-        Span::styled(" Nav  |  ", dim_style),
+        Span::styled(" Filter  |  ", dim_style),
         Span::styled("[space]", key_style),
         Span::styled(" Toggle  |  ", dim_style),
-        Span::styled("[←/→]", key_style),
-        Span::styled(" Seek  |  ", dim_style),
-        Span::styled("[Shift+←/→]", key_style),
-        Span::styled(" Skip  |  ", dim_style),
         Span::styled("[q]", key_style),
         Span::styled(" Quit", dim_style),
     ]);
@@ -1359,6 +1552,51 @@ fn draw_controls_bar(f: &mut Frame, app: &mut App, area: Rect) {
             .title(Span::styled(" Controls ", Style::default().fg(app.theme.title))),
     );
     f.render_widget(bar, area);
+}
+
+fn draw_help_popup(f: &mut Frame, app: &App) {
+    let popup_area = centered_rect(60, 20, f.area());
+    f.render_widget(Clear, popup_area);
+
+    let popup_block = Block::default()
+        .title(Span::styled(" Keybindings Help (Press ? or Esc to close) ", Style::default().fg(app.theme.title)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.border));
+
+    let key_style = Style::default().fg(app.theme.selector).add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(app.theme.text);
+    let section_style = Style::default().fg(app.theme.playing).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+
+    let content = vec![
+        Line::from(Span::styled(" Navigation & Views", section_style)),
+        Line::from(vec![Span::styled("  j / k or ↓ / ↑  ", key_style), Span::styled("Move selection up/down", desc_style)]),
+        Line::from(vec![Span::styled("  l / Enter      ", key_style), Span::styled("Open folder / play track", desc_style)]),
+        Line::from(vec![Span::styled("  h              ", key_style), Span::styled("Go to parent directory", desc_style)]),
+        Line::from(vec![Span::styled("  1 / 2 / 3      ", key_style), Span::styled("Switch to Files / Queue / Zen mode", desc_style)]),
+        Line::from(vec![Span::styled("  /              ", key_style), Span::styled("Filter/search current folder", desc_style)]),
+        Line::from(""),
+        Line::from(Span::styled(" Playback & Queue", section_style)),
+        Line::from(vec![Span::styled("  Space          ", key_style), Span::styled("Toggle play / pause", desc_style)]),
+        Line::from(vec![Span::styled("  n / p          ", key_style), Span::styled("Play next / previous track", desc_style)]),
+        Line::from(vec![Span::styled("  s              ", key_style), Span::styled("Stop playback", desc_style)]),
+        Line::from(vec![Span::styled("  + / -          ", key_style), Span::styled("Increase / decrease volume", desc_style)]),
+        Line::from(vec![Span::styled("  ← / →          ", key_style), Span::styled("Seek backward / forward 5s", desc_style)]),
+        Line::from(vec![Span::styled("  a              ", key_style), Span::styled("Add selected track to queue", desc_style)]),
+        Line::from(vec![Span::styled("  d              ", key_style), Span::styled("Remove selected track from queue", desc_style)]),
+        Line::from(vec![Span::styled("  Shift + J/K    ", key_style), Span::styled("Move item up/down inside queue", desc_style)]),
+        Line::from(""),
+        Line::from(Span::styled(" Settings & Misc", section_style)),
+        Line::from(vec![Span::styled("  r              ", key_style), Span::styled("Cycle loop mode (Off/Track/Queue)", desc_style)]),
+        Line::from(vec![Span::styled("  z              ", key_style), Span::styled("Toggle shuffle", desc_style)]),
+        Line::from(vec![Span::styled("  t              ", key_style), Span::styled("Reload theme configuration", desc_style)]),
+        Line::from(vec![Span::styled("  ?              ", key_style), Span::styled("Toggle this help screen", desc_style)]),
+        Line::from(vec![Span::styled("  q / Esc        ", key_style), Span::styled("Quit application", desc_style)]),
+    ];
+
+    let popup_paragraph = Paragraph::new(content)
+        .block(popup_block);
+
+    f.render_widget(popup_paragraph, popup_area);
 }
 
 fn draw_quit_popup(f: &mut Frame, app: &App) {
@@ -1378,9 +1616,9 @@ fn draw_quit_popup(f: &mut Frame, app: &App) {
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled(" [Y] Yes ", Style::default().fg(app.theme.playing).add_modifier(Modifier::BOLD)),
+            Span::styled(" [Y] Yes ", Style::default().fg(app.theme.yes).add_modifier(Modifier::BOLD)),
             Span::raw("    "),
-            Span::styled(" [N] No ", Style::default().fg(app.theme.title).add_modifier(Modifier::BOLD)),
+            Span::styled(" [N] No ", Style::default().fg(app.theme.no).add_modifier(Modifier::BOLD)),
         ]),
     ];
 
@@ -1429,6 +1667,7 @@ fn run<B: ratatui::backend::Backend>(
 ) -> anyhow::Result<()> {
     loop {
         app.mpv.poll_events();
+        app.sync_mpris();
         app.check_mpv_health();
         app.process_pending_seek();
 
@@ -1470,22 +1709,33 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    if app.show_help_popup {
+        match key.code {
+            KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
+                app.show_help_popup = false;
+            }
+            _ => {}
+        }
+        return;
+    }
+
     if app.is_searching {
         match key.code {
             KeyCode::Esc => {
                 app.is_searching = false;
                 app.search_query.clear();
+                app.update_search_filter();
             }
             KeyCode::Enter => {
                 app.is_searching = false;
             }
             KeyCode::Backspace => {
                 app.search_query.pop();
-                app.update_search_selection();
+                app.update_search_filter();
             }
             KeyCode::Char(c) => {
                 app.search_query.push(c);
-                app.update_search_selection();
+                app.update_search_filter();
             }
             _ => {}
         }
@@ -1495,7 +1745,18 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => app.show_quit_popup = true,
+        KeyCode::Char('q') => app.show_quit_popup = true,
+        KeyCode::Esc => {
+            if app.is_searching {
+                app.is_searching = false;
+                app.search_query.clear();
+                app.update_search_filter();
+            } else {
+                app.show_quit_popup = true;
+            }
+        }
+
+        KeyCode::Char('?') => app.show_help_popup = true,
 
         KeyCode::Media(media_event) => match media_event {
             MediaKeyCode::Play | MediaKeyCode::Pause | MediaKeyCode::PlayPause => {
@@ -1511,9 +1772,21 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('2') => app.mode = ViewMode::Queue,
         KeyCode::Char('3') => app.mode = ViewMode::Zen,
 
+        KeyCode::Char('r') => {
+            app.loop_mode = app.loop_mode.next();
+            app.status = format!("Loop mode: {}", app.loop_mode.label());
+        }
+        KeyCode::Char('z') => {
+            app.is_shuffled = !app.is_shuffled;
+            app.status = format!("Shuffle: {}", if app.is_shuffled { "On" } else { "Off" });
+        }
+
+        KeyCode::Char('t') | KeyCode::Char('T') => app.reload_theme(),
+
         KeyCode::Char('/') if app.mode == ViewMode::Files => {
             app.is_searching = true;
             app.search_query.clear();
+            app.update_search_filter();
         }
 
         KeyCode::Char('J') => app.queue_move_down(),
